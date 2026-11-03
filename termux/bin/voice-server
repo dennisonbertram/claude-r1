@@ -321,6 +321,13 @@ def still_offline():
 def watch_network():
     """Keep `online` in the UI state, so the status row can say Offline before anyone asks; refresh where we are."""
     while True:
+        if ADB_WIFI["on"] and BUTTON.alive:
+            # it came on while Shizuku was down (boot, or the user restarting Shizuku): off 20s after Shizuku is up.
+            # It came on while Shizuku was running: probably on purpose (pairing), so leave it a few minutes.
+            grace = 180 if ADB_WIFI["shizuku_up"] else 20
+            if time.time() - max(ADB_WIFI["since"], BUTTON.alive_since) > grace:
+                ADB_WIFI["on"] = False
+                threading.Thread(target=close_wireless_adb, daemon=True).start()
         if time.time() - LOCATION.at > 900:
             threading.Thread(target=LOCATION.refresh, daemon=True).start()
         up = online()
@@ -988,6 +995,7 @@ class Button:
 
     def __init__(self):
         self._alive = self.down = False
+        self.alive_since = 0.0
         self.timer, self.retry_now = None, False
         self.lock = threading.Lock()
         self.token = uuid.uuid4().hex
@@ -1002,9 +1010,8 @@ class Button:
         # the same Shizuku shell powers Claude's phone controls, so show it as "Phone controls"
         if v != self._alive:
             self._alive = v
+            self.alive_since = time.time()
             HUB.set(controls=v)
-            if v:
-                threading.Thread(target=close_wireless_adb, daemon=True).start()
 
     def run(self):
         srv = socket.socket()
@@ -1101,10 +1108,14 @@ class Button:
             AGENT.ptt_release()
 
 
+ADB_WIFI = {"on": False, "since": 0.0, "shizuku_up": False}   # reported by the launcher
+
+
 def close_wireless_adb():
     """Shizuku's start-on-boot (no root) switches on wireless debugging to start itself and leaves it on.
     Once Shizuku is up it isn't needed, so turn it off: an open adb port on someone else's Wi-Fi is a risk,
-    especially on builds where adb doesn't ask for authorization."""
+    especially on builds where adb doesn't ask for authorization. Only right after boot, so turning wireless
+    debugging on later on purpose (e.g. to pair Shizuku) isn't undone right away."""
     if run(["timeout", "10", "rish", "-c", "settings get global adb_wifi_enabled"]).stdout.strip() == "1":
         run(["timeout", "10", "rish", "-c", "settings put global adb_wifi_enabled 0"])
         log("turned wireless debugging off (Shizuku is running)")
@@ -1218,6 +1229,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             return self.wfile.write(data)
+        if self.path == "/api/adbwifi":
+            try:
+                on = bool(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0))).get("on"))
+            except ValueError:
+                return self.send_error(400)
+            if on and not ADB_WIFI["on"]:
+                ADB_WIFI.update(on=True, since=time.time(), shizuku_up=BUTTON.alive)
+            elif not on:
+                ADB_WIFI["on"] = False
+            self.send_response(204)
+            return self.end_headers()
         if self.path == "/api/sensors":
             try:
                 reading = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))

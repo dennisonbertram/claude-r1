@@ -6,6 +6,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.database.ContentObserver;
 import android.graphics.Color;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -52,6 +53,19 @@ public class MainActivity extends Activity {
     private boolean probing;
     private long lastStartAttempt;
     private volatile boolean awake;
+
+    // ---- wireless debugging: Shizuku's no-root start switches it on and leaves it on; the voice server turns it
+    // off again once Shizuku runs. Only apps can read the setting cheaply, so the launcher reports changes.
+    private final ContentObserver adbWifi = new ContentObserver(new Handler(Looper.getMainLooper())) {
+        @Override public void onChange(boolean selfChange) {
+            reportAdbWifi();
+        }
+    };
+
+    private void reportAdbWifi() {
+        boolean on = Settings.Global.getInt(getContentResolver(), "adb_wifi_enabled", 0) == 1;
+        new Thread(() -> post("api/adbwifi", "{\"on\":" + on + "}")).start();
+    }
 
     // ---- motion: how the R1 is being held, for Claude's context (only while this screen is showing)
     private SensorManager sensors;
@@ -159,12 +173,15 @@ public class MainActivity extends Activity {
         web.loadUrl(SERVER);
         registerReceiver(screenOn, new IntentFilter(Intent.ACTION_SCREEN_ON));
         sensors = getSystemService(SensorManager.class);
+        getContentResolver().registerContentObserver(Settings.Global.getUriFor("adb_wifi_enabled"), false, adbWifi);
+        handler.postDelayed(this::reportAdbWifi, 15000);   // at boot: once the voice server is likely up
         handleAssist(getIntent());
     }
 
     @Override
     protected void onDestroy() {
         unregisterReceiver(screenOn);
+        getContentResolver().unregisterContentObserver(adbWifi);
         super.onDestroy();
     }
 

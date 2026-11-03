@@ -6,7 +6,7 @@
 #   ./install.sh --start-shizuku     only (re)start Shizuku, e.g. after the R1 rebooted
 #   ./install.sh --launcher-apk FILE use a prebuilt launcher instead of building it
 #   ./install.sh --timezone America/New_York
-#   ./install.sh --shizuku-boot      let Shizuku start itself after reboots (read the README's caveat first)
+#   ./install.sh --shizuku-boot      restart Shizuku on the R1 without a computer (read the README's caveat first)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -17,7 +17,7 @@ while [ $# -gt 0 ]; do
     --timezone) TIMEZONE=$2; shift ;;
     --start-shizuku) ONLY_SHIZUKU=1 ;;
     --no-termux) NO_TERMUX=1 ;;
-    --shizuku-boot) SHIZUKU_BOOT=1 ;;  # let Shizuku start itself after a reboot (see README first)      # copy part 2 but don't type it into Termux (run it yourself)
+    --shizuku-boot) SHIZUKU_BOOT=1 ;;  # restart Shizuku on the R1 itself after a reboot (see README first)      # copy part 2 but don't type it into Termux (run it yourself)
     -h|--help) sed -n 2,9p "$0"; exit 0 ;;
     *) echo "unknown option $1"; exit 1 ;;
   esac
@@ -47,7 +47,8 @@ if [ -n "$SHIZUKU_BOOT" ]; then
   cat <<'NOTE'
 Granted. One more step on the R1, once: connect to Wi-Fi, open Settings → System → Developer options → Wireless
 debugging and turn it on, then open Shizuku → "Start via Wireless debugging" → Pairing, and enter the pairing
-code (Wireless debugging → Pair device with pairing code). From then on Shizuku starts by itself after a reboot.
+code (Wireless debugging → Pair device with pairing code). After a reboot, tap "Phone controls off · Fix" on the
+Claude screen, then Start in Shizuku, and allow wireless debugging when asked.
 NOTE
   exit 0
 fi

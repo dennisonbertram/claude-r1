@@ -123,22 +123,26 @@ and run:
 Until then Claude still talks and answers, but can't operate the phone, and the side button only opens Claude
 (it stops listening when you pause instead of when you let go). The status row says *Phone controls off*.
 
-### Or let Shizuku start itself (optional)
-
-Shizuku can start on boot without root, using Android's *wireless debugging*:
+### Or restart Shizuku without a computer (optional)
 
 ```sh
 ./install.sh --shizuku-boot
 ```
 
-then, once on the R1: turn on Settings → Developer options → **Wireless debugging**, open Shizuku →
-**Start via Wireless debugging** and pair it with the code shown under *Pair device with pairing code*.
+then once on the R1: Settings → Developer options → **Wireless debugging** on, open Shizuku →
+**Start via Wireless debugging** → **Pairing**, and enter the code from *Pair device with pairing code*.
+
+After that, when the Claude screen says **Phone controls off · Fix**, tap it, tap **Start** in Shizuku, and allow
+wireless debugging when Android asks. Claude R1 switches wireless debugging off again shortly after Shizuku is up.
+
+Shizuku also tries to start this way by itself at boot, but on the R1 that usually fails: its boot starter runs
+before Wi-Fi has connected, and Android won't enable wireless debugging without a network.
 
 > [!CAUTION]
-> At boot this switches on wireless debugging, which opens an adb port on your Wi-Fi network until Shizuku has
-> started. Claude R1 switches it off again as soon as Shizuku is running (usually within a minute of booting),
-> but on GSI builds where adb doesn't ask for authorization (`ro.adb.secure=0`, common on userdebug images)
-> anyone on the same network could connect during that window. Only use this if you reboot on networks you trust.
+> While wireless debugging is on, adb is reachable from your Wi-Fi network. On GSI builds where adb doesn't ask
+> for authorization (`ro.adb.secure=0`, common on userdebug images) anyone on that network could connect. Claude R1
+> keeps the window short, but only use this on networks you trust, and leave *Always allow on this network* unticked
+> unless you understand the trade-off.
 
 ## Settings
 
