@@ -67,9 +67,11 @@ user wants to see a page (directions: https://www.google.com/maps/dir/?api=1&des
 (search_radio, play_audio), playback (media_control: pause, resume, skip, volume; it also controls other music \
 apps). Playback pauses by itself while the user talks to you. After starting something, reply in a few words.
 - Bluetooth headphones and speakers: bluetooth (status, on, off, pair).
-- Email: read the user's Gmail (search_threads, get_thread) and write drafts (create_draft). You cannot send, \
-delete or archive mail: if asked to send, write the draft and say it's waiting in Drafts. For an inbox \
-overview, show a list card of senders and subjects.
+- Email: if the Gmail tools (search_threads, get_thread, create_draft) are available, use them; otherwise use \
+email_inbox, email_search, email_read and email_draft (the user's mail account set up on the R1). If neither \
+works, say email isn't connected yet and that it can be set up from the computer. You can read mail and write \
+drafts but never send, delete or archive: if asked to send, write the draft and say it's waiting in Drafts. \
+For an inbox overview, show a list card of senders and subjects.
 - Your voice: change it with list_voices and set_voice when asked.
 - Your body: the context note says how the R1 is being held and whether it's moving (device_motion gives \
 detail). Let it shape your answers: someone walking wants it shorter; lying face down on a table means they \
@@ -572,7 +574,8 @@ TOOL_LABELS = {"screenshot": "Looking at the screen", "ui_elements": "Reading th
                "search_podcasts": "Finding podcasts", "podcast_episodes": "Getting episodes",
                "search_radio": "Finding stations", "play_audio": "Starting playback", "media_control": "Adjusting playback",
                "search_threads": "Checking your email", "get_thread": "Reading an email", "get_message": "Reading an email",
-               "create_draft": "Drafting an email", "set_voice": "Changing my voice",
+               "create_draft": "Drafting an email", "email_inbox": "Checking your email", "email_search": "Searching your email",
+               "email_read": "Reading an email", "email_draft": "Drafting an email", "set_voice": "Changing my voice",
                "open_url": "Opening the page"}
 
 
@@ -1000,6 +1003,8 @@ class Button:
         if v != self._alive:
             self._alive = v
             HUB.set(controls=v)
+            if v:
+                threading.Thread(target=close_wireless_adb, daemon=True).start()
 
     def run(self):
         srv = socket.socket()
@@ -1094,6 +1099,15 @@ class Button:
         else:
             self.timer and self.timer.cancel()
             AGENT.ptt_release()
+
+
+def close_wireless_adb():
+    """Shizuku's start-on-boot (no root) switches on wireless debugging to start itself and leaves it on.
+    Once Shizuku is up it isn't needed, so turn it off: an open adb port on someone else's Wi-Fi is a risk,
+    especially on builds where adb doesn't ask for authorization."""
+    if run(["timeout", "10", "rish", "-c", "settings get global adb_wifi_enabled"]).stdout.strip() == "1":
+        run(["timeout", "10", "rish", "-c", "settings put global adb_wifi_enabled 0"])
+        log("turned wireless debugging off (Shizuku is running)")
 
 
 BUTTON = Button()

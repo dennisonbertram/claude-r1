@@ -83,13 +83,17 @@ Then hold the side button and ask something.
 
 ### Connect your email
 
-Email goes through your **Claude account**, not the R1: open [claude.ai](https://claude.ai) → Settings →
-Connectors and connect **Gmail**. Claude Code on the R1 is logged into the same account, so from then on you can
-ask "what's new in my inbox?" or "draft a reply to Sam". Claude can read mail and write drafts; it cannot send,
-delete or archive anything (drafts wait in Gmail for you to send).
+Claude can read your mail and write drafts. It never sends, deletes or archives anything; drafts wait in your
+mailbox for you to send. There are two ways to connect it:
 
-If Gmail isn't connected, Claude will tell you it can't reach your email. Reading mail through the R1's own
-Android account (IMAP with an app password, for non-Gmail accounts too) is planned but not built yet.
+- **Gmail through your Claude account (easiest).** At [claude.ai](https://claude.ai) → Settings → Connectors,
+  connect **Gmail**. Claude Code on the R1 is logged into the same account, so it can use it right away.
+- **Any mailbox over IMAP.** For other providers, or if you'd rather not connect Gmail to Claude: create an
+  *app password* with your provider (Gmail: Google Account → Security → App passwords; iCloud, Outlook, Yahoo
+  and Fastmail have them too) and give it to `termux/setup.sh` when it asks about email. It's stored only on the
+  R1, in `~/.config/r1/email.json`. To add it later, run `bash /sdcard/Download/claude-r1/termux/setup.sh` again.
+
+Then ask "what's new in my inbox?" or "draft a reply to Sam saying I'll be late".
 
 ## Using it
 
@@ -119,6 +123,23 @@ and run:
 Until then Claude still talks and answers, but can't operate the phone, and the side button only opens Claude
 (it stops listening when you pause instead of when you let go). The status row says *Phone controls off*.
 
+### Or let Shizuku start itself (optional)
+
+Shizuku can start on boot without root, using Android's *wireless debugging*:
+
+```sh
+./install.sh --shizuku-boot
+```
+
+then, once on the R1: turn on Settings → Developer options → **Wireless debugging**, open Shizuku →
+**Start via Wireless debugging** and pair it with the code shown under *Pair device with pairing code*.
+
+> [!CAUTION]
+> At boot this switches on wireless debugging, which opens an adb port on your Wi-Fi network until Shizuku has
+> started. Claude R1 switches it off again as soon as Shizuku is running (usually within a minute of booting),
+> but on GSI builds where adb doesn't ask for authorization (`ro.adb.secure=0`, common on userdebug images)
+> anyone on the same network could connect during that window. Only use this if you reboot on networks you trust.
+
 ## Settings
 
 Files in Termux's `~/.config/r1/`:
@@ -130,6 +151,7 @@ Files in Termux's `~/.config/r1/`:
 | `home_location` | Your home city, the default for weather and places |
 | `claude_model` | Claude model for the voice assistant (default `claude-haiku-5-5`, fastest) |
 | `memory.json` | What Claude remembers about you |
+| `email.json` | IMAP email account (address + app password), if you set one up |
 | `mcp_token` | Secret between Claude and the Android tools; created automatically |
 
 ## How it works

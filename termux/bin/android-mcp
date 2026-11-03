@@ -284,6 +284,114 @@ def t_recall(a):
                                                                for f in facts) if facts else "Nothing stored yet."), False
 
 
+# ---- email over IMAP: for mail that isn't connected to the user's Claude account (any provider, app password).
+# Reading and drafts only, like the Gmail connector: nothing here can send or delete.
+
+EMAIL_FILE = os.path.join(CONF, "email.json")
+IMAP_HOSTS = {"gmail.com": "imap.gmail.com", "googlemail.com": "imap.gmail.com", "outlook.com": "outlook.office365.com",
+              "hotmail.com": "outlook.office365.com", "live.com": "outlook.office365.com", "icloud.com": "imap.mail.me.com",
+              "me.com": "imap.mail.me.com", "yahoo.com": "imap.mail.yahoo.com", "fastmail.com": "imap.fastmail.com"}
+
+
+def imap():
+    """Logged-in IMAP connection from ~/.config/r1/email.json: {"address", "password", optional "imap_host"}."""
+    import imaplib
+    try:
+        cfg = json.load(open(EMAIL_FILE))
+    except (OSError, ValueError):
+        raise RuntimeError("No email account is set up. The user can add one by running the R1 setup again "
+                           "(termux/setup.sh) with an email address and an app password.")
+    host = cfg.get("imap_host") or IMAP_HOSTS.get(cfg["address"].split("@")[-1].lower(), "imap." + cfg["address"].split("@")[-1])
+    conn = imaplib.IMAP4_SSL(host, int(cfg.get("imap_port", 993)), timeout=20)
+    conn.login(cfg["address"], cfg["password"])
+    return conn
+
+
+def header(raw, name):
+    import email.header
+    value = email.message_from_bytes(raw).get(name, "")
+    return str(email.header.make_header(email.header.decode_header(value))) if value else ""
+
+
+def summaries(conn, ids):
+    lines = []
+    for i in reversed(ids):
+        typ, data = conn.fetch(i, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            continue
+        raw, flags = data[0][1], data[0][0].decode(errors="replace")
+        unread = "" if "\\Seen" in flags else " [unread]"
+        lines.append(f"#{i.decode()}{unread} {header(raw, 'Date')[:16]} | {header(raw, 'From')} | {header(raw, 'Subject')}")
+    return lines
+
+
+def t_email_inbox(a):
+    import email
+    conn = imap()
+    try:
+        conn.select("INBOX", readonly=True)
+        typ, data = conn.search(None, "UNSEEN" if a.get("unread_only") else "ALL")
+        ids = data[0].split()[-int(a.get("count", 8)):]
+        return text("\n".join(summaries(conn, ids)) or "The inbox is empty."), False
+    finally:
+        conn.logout()
+
+
+def t_email_search(a):
+    import email
+    conn = imap()
+    try:
+        conn.select("INBOX", readonly=True)
+        q = str(a["query"]).replace('"', "")
+        typ, data = conn.search("UTF-8", "TEXT", f'"{q}"')
+        ids = data[0].split()[-int(a.get("count", 8)):]
+        return text("\n".join(summaries(conn, ids)) or "No matching mail."), False
+    finally:
+        conn.logout()
+
+
+def t_email_read(a):
+    import email
+    conn = imap()
+    try:
+        conn.select("INBOX", readonly=True)
+        typ, data = conn.fetch(str(a["id"]).lstrip("#"), "(BODY.PEEK[])")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            return text("No such message."), True
+        msg = email.message_from_bytes(data[0][1])
+        part = next((p for p in msg.walk() if p.get_content_type() == "text/plain"), None) or \
+            next((p for p in msg.walk() if p.get_content_type() == "text/html"), msg)
+        body = (part.get_payload(decode=True) or b"").decode(part.get_content_charset() or "utf-8", errors="replace")
+        if part.get_content_type() == "text/html":
+            body = re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(style|script).*?</\1>", " ", body))
+        body = re.sub(r"\s+\n", "\n", re.sub(r"[ \t]+", " ", body)).strip()
+        return text(f"From: {header(data[0][1], 'From')}\nDate: {header(data[0][1], 'Date')}\n"
+                    f"Subject: {header(data[0][1], 'Subject')}\n\n{body[:4000]}"), False
+    finally:
+        conn.logout()
+
+
+def t_email_draft(a):
+    import email.message, imaplib
+    conn = imap()
+    try:
+        cfg = json.load(open(EMAIL_FILE))
+        drafts = "Drafts"
+        typ, boxes = conn.list()
+        for b in boxes or []:
+            line = b.decode(errors="replace")
+            if "\\Drafts" in line:
+                drafts = line.rsplit(' "/" ', 1)[-1].strip().strip('"')
+                break
+        msg = email.message.EmailMessage()
+        msg["From"], msg["To"], msg["Subject"] = cfg["address"], a["to"], a.get("subject", "")
+        msg.set_content(str(a["body"]))
+        typ, _ = conn.append(f'"{drafts}"', "\\Draft", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+        return text("Draft saved in Drafts; the user sends it themselves." if typ == "OK" else "Couldn't save the draft."), typ != "OK"
+    finally:
+        conn.logout()
+
+
 # ---- body: vibration and motion
 
 VIBRATIONS = {"tap": "oneshot 40", "double": "waveform -a 60 255 120 0 60 255", "long": "oneshot 600",
@@ -539,6 +647,15 @@ TOOLS = [
     ("open_url", "Open a web page in the browser on the device for the user to look at "
      "(e.g. nytimes.com). Only when they want to see it; to answer a question, use WebFetch instead.",
      {"url": {"type": "string"}}, ["url"], t_open_url),
+    ("email_inbox", "Latest emails in the user's inbox (IMAP account set up on the R1): id, date, sender, subject, "
+     "unread marker. Use when the Gmail connector tools aren't available.",
+     {"count": {"type": "integer"}, "unread_only": {"type": "boolean"}}, [], t_email_inbox),
+    ("email_search", "Search the user's inbox (IMAP) for words in any field.",
+     {"query": {"type": "string"}, "count": {"type": "integer"}}, ["query"], t_email_search),
+    ("email_read", "Read one email (IMAP) by its id from email_inbox/email_search. Leaves it unread.",
+     {"id": {"type": "string"}}, ["id"], t_email_read),
+    ("email_draft", "Save an email draft in the user's Drafts folder (IMAP). Nothing is sent; the user sends it.",
+     {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, ["to", "body"], t_email_draft),
     ("vibrate", "Vibrate the R1: tap (subtle confirm), double (nudge), long, alert (urgent, three pulses), heartbeat. "
      "Use it sparingly, e.g. to confirm something done silently or to get attention.",
      {"pattern": {"type": "string", "enum": list(VIBRATIONS)}}, [], t_vibrate),

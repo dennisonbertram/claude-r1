@@ -75,6 +75,19 @@ if [ ! -s "$CONF/elevenlabs_key" ]; then
   read -rsp "Paste your ElevenLabs key (or press Enter to skip): " KEY; echo
   if [ -n "$KEY" ]; then (umask 077; printf '%s' "$KEY" > "$CONF/elevenlabs_key"); echo "Saved."; fi
 fi
+if [ ! -s "$CONF/email.json" ]; then
+  echo
+  echo "Email (optional): if Gmail is connected to your Claude account (claude.ai → Settings → Connectors) you can"
+  echo "skip this. Otherwise Claude can read any mailbox over IMAP with an app password (Gmail: myaccount.google.com"
+  echo "→ App passwords; iCloud, Outlook, Yahoo and Fastmail have them too). Claude reads and drafts, never sends."
+  read -rp "Email address (Enter to skip): " MAIL
+  if [ -n "$MAIL" ]; then
+    read -rsp "App password: " MAILPW; echo
+    (umask 077; python3 -c 'import json,sys; print(json.dumps({"address": sys.argv[1], "password": sys.argv[2]}))' \
+      "$MAIL" "$MAILPW" > "$CONF/email.json")
+    echo "Saved."
+  fi
+fi
 if [ ! -s "$CONF/home_location" ]; then
   read -rp "Your home city, for weather and places (e.g. 'Brooklyn, New York'; Enter to skip): " HOMEAREA
   [ -n "$HOMEAREA" ] && printf '%s' "$HOMEAREA" > "$CONF/home_location"

@@ -6,16 +6,18 @@
 #   ./install.sh --start-shizuku     only (re)start Shizuku, e.g. after the R1 rebooted
 #   ./install.sh --launcher-apk FILE use a prebuilt launcher instead of building it
 #   ./install.sh --timezone America/New_York
+#   ./install.sh --shizuku-boot      let Shizuku start itself after reboots (read the README's caveat first)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-LAUNCHER_APK="" TIMEZONE="" ONLY_SHIZUKU="" NO_TERMUX=""
+LAUNCHER_APK="" TIMEZONE="" ONLY_SHIZUKU="" NO_TERMUX="" SHIZUKU_BOOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --launcher-apk) LAUNCHER_APK=$2; shift ;;
     --timezone) TIMEZONE=$2; shift ;;
     --start-shizuku) ONLY_SHIZUKU=1 ;;
-    --no-termux) NO_TERMUX=1 ;;      # copy part 2 but don't type it into Termux (run it yourself)
+    --no-termux) NO_TERMUX=1 ;;
+    --shizuku-boot) SHIZUKU_BOOT=1 ;;  # let Shizuku start itself after a reboot (see README first)      # copy part 2 but don't type it into Termux (run it yourself)
     -h|--help) sed -n 2,9p "$0"; exit 0 ;;
     *) echo "unknown option $1"; exit 1 ;;
   esac
@@ -38,6 +40,17 @@ SDK=$(sh_ getprop ro.build.version.sdk)
 [ "$SDK" -ge 33 ] || die "This needs Android 13+ (found SDK $SDK). Flash a GSI first; see README."
 
 if [ -n "$ONLY_SHIZUKU" ]; then start_shizuku; exit 0; fi
+if [ -n "$SHIZUKU_BOOT" ]; then
+  # Shizuku's own boot starter (Android 13+, no root): with this permission it turns on wireless debugging at
+  # boot and starts itself. The voice server turns wireless debugging off again as soon as Shizuku is up.
+  adb shell pm grant moe.shizuku.privileged.api android.permission.WRITE_SECURE_SETTINGS
+  cat <<'NOTE'
+Granted. One more step on the R1, once: connect to Wi-Fi, open Settings → System → Developer options → Wireless
+debugging and turn it on, then open Shizuku → "Start via Wireless debugging" → Pairing, and enter the pairing
+code (Wireless debugging → Pair device with pairing code). From then on Shizuku starts by itself after a reboot.
+NOTE
+  exit 0
+fi
 
 # ---------------------------------------------------------------- apps
 mkdir -p downloads

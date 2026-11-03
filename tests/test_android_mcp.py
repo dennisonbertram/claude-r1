@@ -1,4 +1,4 @@
-import os, tempfile, unittest
+import os, tempfile, unittest, unittest.mock
 from importlib.machinery import SourceFileLoader
 from importlib.util import spec_from_loader, module_from_spec
 
@@ -57,3 +57,71 @@ class MemoryToolsTest(unittest.TestCase):
             m.t_forget({"fact": "jazz"})
             self.assertNotIn("jazz", m.t_recall({})[0][0]["text"])
             self.assertTrue(m.t_forget({"fact": "nothing like this"})[1])
+
+
+class FakeIMAP:
+    """Just enough of imaplib.IMAP4_SSL for the email tools."""
+    MSGS = {b"1": (b"\\Seen", b"From: Ann <ann@example.com>\r\nSubject: Lunch\r\nDate: Mon, 2 Nov 2026 12:00:00 -0500\r\n\r\nNoon at Lucali?\r\n"),
+            b"2": (b"", b"From: Bank <no-reply@bank.example>\r\nSubject: Statement ready\r\nDate: Tue, 3 Nov 2026 09:00:00 -0500\r\n\r\nYour statement is ready.\r\n")}
+    appended = []
+
+    def __init__(self, host, port, timeout=None):
+        self.host = host
+    def login(self, user, password): return "OK", [b"logged in"]
+    def logout(self): pass
+    def select(self, box, readonly=False):
+        self.readonly = readonly
+        return "OK", [b"2"]
+    def search(self, charset, *criteria):
+        if criteria[0] == "UNSEEN":
+            return "OK", [b"2"]
+        if criteria[0] == "TEXT":
+            word = criteria[1].strip('"').lower()
+            return "OK", [b" ".join(i for i, (_, raw) in self.MSGS.items() if word in raw.decode().lower())]
+        return "OK", [b"1 2"]
+    def fetch(self, i, what):
+        i = i if isinstance(i, bytes) else i.encode()
+        flags, raw = self.MSGS[i]
+        return "OK", [(b"%s (FLAGS (%s) BODY[])" % (i, flags), raw), b")"]
+    def list(self):
+        return "OK", [b'(\\HasNoChildren \\Drafts) "/" "[Gmail]/Drafts"', b'(\\HasNoChildren) "/" "INBOX"']
+    def append(self, box, flags, when, msg):
+        FakeIMAP.appended.append((box, msg))
+        return "OK", [b"appended"]
+
+
+class EmailToolsTest(unittest.TestCase):
+    def setUp(self):
+        self.m = load()
+        self.dir = tempfile.TemporaryDirectory()
+        self.m.EMAIL_FILE = os.path.join(self.dir.name, "email.json")
+        with open(self.m.EMAIL_FILE, "w") as f:
+            f.write('{"address": "me@gmail.com", "password": "app-password"}')
+        import imaplib
+        self.patch = unittest.mock.patch.object(imaplib, "IMAP4_SSL", FakeIMAP)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.dir.cleanup()
+
+    def test_inbox_newest_first_with_unread_marker(self):
+        out = self.m.t_email_inbox({})[0][0]["text"].splitlines()
+        self.assertTrue(out[0].startswith("#2 [unread]") and "Statement ready" in out[0], out)
+        self.assertIn("Ann <ann@example.com> | Lunch", out[1])
+
+    def test_read_and_search(self):
+        self.assertIn("Noon at Lucali?", self.m.t_email_read({"id": "#1"})[0][0]["text"])
+        self.assertIn("Statement ready", self.m.t_email_search({"query": "statement"})[0][0]["text"])
+
+    def test_draft_goes_to_the_drafts_folder(self):
+        text, err = self.m.t_email_draft({"to": "ann@example.com", "subject": "Re: Lunch", "body": "See you there"})
+        self.assertFalse(err)
+        box, msg = FakeIMAP.appended[-1]
+        self.assertEqual(box, '"[Gmail]/Drafts"')
+        self.assertIn(b"See you there", msg)
+
+    def test_no_account_explains_setup(self):
+        os.remove(self.m.EMAIL_FILE)
+        with self.assertRaisesRegex(RuntimeError, "No email account"):
+            self.m.t_email_inbox({})
