@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #ff5a1f; color: #120c08;
+    font-family: "Inter Tight", "Roboto", system-ui, sans-serif; overflow: hidden; }
+  .status { position: absolute; top: 24px; left: 26px; right: 26px; display: flex; justify-content: space-between;
+    font-size: 15px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; opacity: .7; }
+  .big { position: absolute; left: 26px; right: 26px; top: 90px; font-size: 76px; line-height: .92;
+    font-weight: 900; letter-spacing: -0.045em; }
+  .sub { position: absolute; left: 26px; right: 26px; bottom: 44px; font-size: 20px; font-weight: 600; opacity: .7; }
+  .stuck .big { font-size: 52px; }
+  .opts { position: absolute; left: 22px; right: 22px; bottom: 26px; display: none; flex-direction: column; gap: 12px; }
+  .opts button { height: 64px; border: 0; border-radius: 18px; background: #120c08; color: #fff; text-align: left;
+    padding: 0 22px; font: 800 26px/1 "Inter Tight", system-ui, sans-serif; }
+  .opts button:first-child { background: #fff; color: #120c08; }
+  .dots::after { content: ""; animation: d 1.2s steps(4) infinite; }
+  @keyframes d { 0% { content: "" } 25% { content: "." } 50% { content: ".." } 75% { content: "..." } }
+</style>
+</head>
+<body>
+  <div class="status"><span>Claude</span><span>R1</span></div>
+  <div class="big" id="big">Starting<br>Claude<span class="dots"></span></div>
+  <div class="sub" id="sub">This takes a few seconds</div>
+  <div class="opts" id="opts">
+    <button onclick="R1.retryStart(); restart()">Try again</button>
+    <button onclick="R1.openApp('fr.neamar.kiss')">Apps</button>
+    <button onclick="R1.openSettings()">Settings</button>
+  </div>
+<script>
+  // at 15s offer a way out (the buttons replace the subline); at 40s say it didn't start
+  const OFFER_MS = 15000, STUCK_MS = 40000;
+  let early, timer;
+  function restart() {
+    document.body.classList.remove("stuck");
+    document.getElementById("opts").style.display = "none";
+    document.getElementById("big").innerHTML = 'Starting<br>Claude<span class="dots"></span>';
+    document.getElementById("sub").style.display = "";
+    document.getElementById("sub").textContent = "This takes a few seconds";
+    clearTimeout(early); clearTimeout(timer);
+    early = setTimeout(offer, OFFER_MS);
+    timer = setTimeout(stuck, STUCK_MS);
+  }
+  function offer() {
+    document.getElementById("sub").style.display = "none";
+    document.getElementById("opts").style.display = "flex";
+  }
+  function stuck() {
+    document.body.classList.add("stuck");
+    document.getElementById("big").innerHTML = "Claude didn\u2019t start.";
+    offer();
+  }
+  restart();
+</script>
+</body>
+</html>

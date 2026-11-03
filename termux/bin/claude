@@ -1,0 +1,5 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Run the Linux build of Claude Code inside the proot Debian, in the current directory.
+exec proot-distro login debian --shared-tmp -- \
+  env PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin TERM="$TERM" \
+  bash -c 'cd "$1" 2>/dev/null || cd /root; shift; exec claude "$@"' _ "$PWD" "$@"

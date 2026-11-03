@@ -1,0 +1,5 @@
+downloads/
+launcher/build/
+launcher/*.keystore
+.DS_Store
+node_modules/

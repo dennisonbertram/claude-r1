@@ -1,0 +1,668 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""Android control for Claude Code on the Rabbit R1, as an MCP server (streamable HTTP).
+
+Listens on 127.0.0.1:8766/mcp and requires `Authorization: Bearer <token>` (token in
+~/.config/r1/mcp_token, created on first run) so other apps on the device can't use it.
+
+Commands run as Android's `shell` user through Shizuku's `rish`. Starting rish costs ~3s on
+the R1, so one rish shell stays open and commands are streamed into it (~40ms each).
+Needs the Shizuku server running (it stops on reboot; restart it from the Shizuku app or adb).
+"""
+import base64, json, os, re, secrets, signal, subprocess, tempfile, threading, time, urllib.parse, urllib.request, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOST, PORT = "127.0.0.1", 8766
+CONF = os.path.expanduser("~/.config/r1")
+TOKEN_FILE = os.path.join(CONF, "mcp_token")
+CAMERA_DIR = "/sdcard/DCIM/Camera"
+
+
+def token():
+    os.makedirs(CONF, mode=0o700, exist_ok=True)
+    if not os.path.exists(TOKEN_FILE):
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.write(fd, secrets.token_hex(24).encode())
+        os.close(fd)
+    return open(TOKEN_FILE).read().strip()
+
+
+# ---------------------------------------------------------------- shell
+
+class Shell:
+    """A long-lived `rish` shell (uid shell). Thread-safe; restarts itself if it dies."""
+
+    def __init__(self):
+        self.proc, self.lock = None, threading.Lock()
+
+    def _start(self):
+        # own process group: rish is a script whose app_process child holds the pipes
+        self.proc = subprocess.Popen(["rish"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+
+    def _kill(self):
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def run(self, cmd, timeout=30):
+        """Run `cmd`; return (output bytes, exit code). Raises RuntimeError if Shizuku is down."""
+        with self.lock:
+            if not self.proc or self.proc.poll() is not None:
+                self._start()
+            mark = uuid.uuid4().hex
+            # the command runs in a subshell (so `exit` or a syntax error can't kill the session)
+            # under Android's own timeout, so a stuck command can't wedge the shell
+            # output may not end in a newline (base64 -w0, XML), so start the marker on a fresh line
+            self.proc.stdin.write(f"timeout {int(timeout)} sh -c {q(cmd)} 2>&1 </dev/null\n"
+                                  f"printf '\\n{mark} %s\\n' $?\n".encode())
+            self.proc.stdin.flush()
+            out, deadline = b"", time.time() + timeout
+            timer = threading.Timer(timeout + 5, self._kill)
+            timer.start()
+            try:
+                for line in self.proc.stdout:
+                    if line.startswith(mark.encode()):
+                        return out[:-1], int(line.split()[1])   # drop the newline printed before the marker
+                    out += line
+            finally:
+                timer.cancel()
+            self.proc = None
+            if time.time() >= deadline + 5:
+                raise RuntimeError(f"command timed out after {timeout}s")
+            raise RuntimeError("Shizuku shell exited: " + out.decode(errors="replace")[-400:])
+
+
+SH = Shell()
+
+
+def sh(cmd, timeout=30):
+    out, rc = SH.run(cmd, timeout)
+    return out.decode(errors="replace").strip(), rc
+
+
+def q(s):
+    """Single-quote for the Android shell."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+# ---------------------------------------------------------------- tools
+
+def text(s):
+    return [{"type": "text", "text": s}]
+
+
+def image(png_or_jpeg, mime):
+    return [{"type": "image", "data": base64.b64encode(png_or_jpeg).decode(), "mimeType": mime}]
+
+
+def t_screenshot(a):
+    out, rc = SH.run("screencap -p | base64 -w0")
+    if rc:
+        return text("screencap failed: " + out.decode(errors="replace")), True
+    return image(base64.b64decode(out.strip()), "image/png") + text(
+        "Screen is 480x640 (portrait). Use these pixel coordinates with tap/swipe."), False
+
+
+def t_ui_elements(a):
+    out, rc = sh("uiautomator dump /sdcard/.r1_ui.xml >/dev/null && cat /sdcard/.r1_ui.xml", 40)
+    if rc or "<hierarchy" not in out:
+        return text("uiautomator dump failed: " + out[-300:]), True
+    rows = []
+    for m in re.finditer(r"<node [^>]*?/?>", out):
+        n = m.group(0)
+        attr = lambda k: (re.search(k + r'="([^"]*)"', n) or [None, ""])[1]
+        label = attr("text") or attr("content-desc") or attr("resource-id").split("/")[-1]
+        clickable = attr("clickable") == "true"
+        if not label and not clickable:
+            continue
+        b = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attr("bounds") or "")
+        if not b:
+            continue
+        x1, y1, x2, y2 = map(int, b.groups())
+        kind = attr("class").split(".")[-1]
+        rows.append(f"({(x1 + x2) // 2},{(y1 + y2) // 2}) {kind}{' [tap]' if clickable else ''}: "
+                    f"{label.replace('&#10;', ' ')[:80]}")
+    pkg = re.search(r'package="([^"]+)"', out)
+    head = f"Foreground app: {pkg[1] if pkg else '?'}. Elements as (centre x,y) class: label\n"
+    return text(head + "\n".join(rows) if rows else head + "(no labelled elements)"), False
+
+
+def t_tap(a):
+    _, rc = sh(f"input tap {int(a['x'])} {int(a['y'])}")
+    return text(f"tapped ({a['x']},{a['y']})"), bool(rc)
+
+
+def t_swipe(a):
+    _, rc = sh(f"input swipe {int(a['x1'])} {int(a['y1'])} {int(a['x2'])} {int(a['y2'])} "
+               f"{int(a.get('duration_ms', 300))}")
+    return text("swiped"), bool(rc)
+
+
+def t_type_text(a):
+    # `input text` treats %s as space and chokes on some characters; type word by word
+    parts = str(a["text"]).split(" ")
+    cmds = []
+    for i, w in enumerate(parts):
+        if w:
+            cmds.append("input text " + q(w))
+        if i < len(parts) - 1:
+            cmds.append("input keyevent KEYCODE_SPACE")
+    if a.get("submit"):
+        cmds.append("input keyevent KEYCODE_ENTER")
+    out, rc = sh(" && ".join(cmds) or "true")
+    return text(out or "typed"), bool(rc)
+
+
+KEYS = {"home": "HOME", "back": "BACK", "enter": "ENTER", "recents": "APP_SWITCH", "power": "POWER",
+        "wakeup": "WAKEUP", "sleep": "SLEEP", "volume_up": "VOLUME_UP", "volume_down": "VOLUME_DOWN",
+        "mute": "VOLUME_MUTE", "delete": "DEL", "tab": "TAB", "escape": "ESCAPE", "up": "DPAD_UP",
+        "down": "DPAD_DOWN", "left": "DPAD_LEFT", "right": "DPAD_RIGHT", "play_pause": "MEDIA_PLAY_PAUSE",
+        "camera": "CAMERA", "notifications": "NOTIFICATION"}
+
+
+def t_press_key(a):
+    k = str(a["key"]).lower()
+    code = KEYS.get(k, k.upper().removeprefix("KEYCODE_"))
+    out, rc = sh(f"input keyevent KEYCODE_{code}")
+    return text(out or f"pressed {code}"), bool(rc)
+
+
+def launchables():
+    out, _ = sh("cmd package query-activities --brief -a android.intent.action.MAIN "
+                "-c android.intent.category.LAUNCHER")
+    return sorted({l.strip().split("/")[0] for l in out.splitlines() if "/" in l})
+
+
+def t_list_apps(a):
+    return text("Launchable apps (package names):\n" + "\n".join(launchables())), False
+
+
+# everyday names for apps whose package names don't say what they are
+APP_ALIASES = {"camera": "org.lineageos.aperture", "browser": "org.lineageos.jelly",
+               "web": "org.lineageos.jelly", "chrome": "org.lineageos.jelly", "music": "org.lineageos.twelve",
+               "files": "com.android.documentsui", "launcher": "fr.neamar.kiss", "claude": "ai.r1.claude",
+               "terminal": "com.termux", "gallery": "org.lineageos.glimpse", "photos": "org.lineageos.glimpse"}
+
+
+def t_open_app(a):
+    want = str(a["app"]).lower().strip()
+    want = APP_ALIASES.get(want, want)
+    pkgs = launchables()
+    match = next((p for p in pkgs if p.lower() == want), None) or \
+        next((p for p in pkgs if want.replace(" ", "") in p.lower()), None)
+    if not match:
+        return text(f"No launchable app matching '{a['app']}'. Use list_apps."), True
+    out, rc = sh(f"monkey -p {q(match)} -c android.intent.category.LAUNCHER 1")
+    return text(f"opened {match}" if not rc else out), bool(rc)
+
+
+CARD_TYPES = ("weather", "flight", "stock", "list", "fact", "html")
+
+
+def t_show_card(a):
+    """Hand a card to the voice UI (voice-server on :8765), which draws it above the spoken reply."""
+    card = a.get("card") or {}
+    if card.get("type") not in CARD_TYPES:
+        return text(f"card.type must be one of {', '.join(CARD_TYPES)}"), True
+    req = urllib.request.Request("http://127.0.0.1:8765/api/card", data=json.dumps(card).encode(),
+                                 method="POST", headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+    except OSError as e:
+        return text(f"voice UI not reachable: {e}"), True
+    return text("Card is on screen. Now give your short spoken reply; don't repeat every number on the card."), False
+
+
+def t_take_photo(a):
+    """Open the camera in photo mode and press the shutter. The voice app picks the new photo up
+    from the camera folder by itself and brings it (with a description) into the conversation."""
+    before = set(os.listdir(CAMERA_DIR)) if os.path.isdir(CAMERA_DIR) else set()
+    sh("am start -a android.media.action.STILL_IMAGE_CAMERA")
+    time.sleep(2.5)                                   # let the viewfinder settle
+    sh("input keyevent KEYCODE_CAMERA")
+    for _ in range(16):
+        time.sleep(0.5)
+        if set(os.listdir(CAMERA_DIR)) - before:
+            return text("Photo taken. It will show up here with a description in a moment; "
+                        "reply with at most a few words, don't describe it yet."), False
+    return text("The camera opened but no photo was saved."), True
+
+
+def t_open_url(a):
+    url = str(a["url"]).strip()
+    if re.match(r"^[a-z][a-z0-9+.-]*:", url, re.I) and not re.match(r"^https?://", url, re.I):
+        return text("Only http(s) links open in the browser here (no intent:// or app links)."), True
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    out, rc = sh(f"am start -a android.intent.action.VIEW -d {q(url)} org.lineageos.jelly")
+    return text(f"opened {url} in the browser" if not rc else out), bool(rc)
+
+
+# ---- memory: facts about the user, kept across conversations (voice-server puts them in Claude's
+# instructions at the start of every session)
+
+MEMORY_FILE = os.path.join(CONF, "memory.json")
+
+
+def load_memory():
+    try:
+        return json.load(open(MEMORY_FILE))
+    except (OSError, ValueError):
+        return []
+
+
+def save_memory(facts):
+    tmp = MEMORY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(facts, f, indent=1)
+    os.replace(tmp, MEMORY_FILE)
+
+
+def t_remember(a):
+    fact = " ".join(str(a["fact"]).split())
+    facts = load_memory()
+    if any(f["fact"].lower() == fact.lower() for f in facts):
+        return text("Already remembered."), False
+    facts.append({"id": max([f["id"] for f in facts] or [0]) + 1, "fact": fact, "added": time.strftime("%Y-%m-%d")})
+    save_memory(facts)
+    return text(f"Remembered: {fact}"), False
+
+
+def t_forget(a):
+    facts, what = load_memory(), str(a["fact"]).strip().lower()
+    keep = [f for f in facts if not (what == str(f["id"]) or what in f["fact"].lower())]
+    if len(keep) == len(facts):
+        return text("Nothing matched; use recall to see what's stored."), True
+    save_memory(keep)
+    return text(f"Forgot {len(facts) - len(keep)} fact(s)."), False
+
+
+def t_recall(a):
+    facts = load_memory()
+    return text("What you know about the user:\n" + "\n".join(f"{f['id']}. {f['fact']} (since {f['added']})"
+                                                               for f in facts) if facts else "Nothing stored yet."), False
+
+
+# ---- body: vibration and motion
+
+VIBRATIONS = {"tap": "oneshot 40", "double": "waveform -a 60 255 120 0 60 255", "long": "oneshot 600",
+              "alert": "waveform -a 200 255 150 0 200 255 150 0 200 255", "heartbeat": "waveform -a 70 255 110 0 90 180"}
+
+
+def t_vibrate(a):
+    pattern = str(a.get("pattern", "tap")).lower()
+    out, rc = sh(f"cmd vibrator_manager synced -f {VIBRATIONS.get(pattern, VIBRATIONS['tap'])}")
+    return text(out or f"Vibrated ({pattern})."), bool(rc)
+
+
+def t_device_motion(a):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8765/api/sensors", timeout=5) as r:
+            m = json.load(r)
+    except OSError as e:
+        return text(f"No motion data: {e}"), True
+    if not m:
+        return text("No motion reading yet (the sensors are read while Claude's screen is showing)."), False
+    return text(f"{m['posture']}, {m['motion']} ({int(time.time() - m['at'])} s ago). Gravity x/y/z "
+                f"{m['gravity']} m/s² (y = along the screen, z = out of the screen); movement {m['movement']} m/s²."), False
+
+
+# ---- bluetooth
+
+def t_bluetooth(a):
+    action = str(a.get("action", "status")).lower()
+    if action in ("on", "off"):
+        out, rc = sh(f"cmd bluetooth_manager {'enable' if action == 'on' else 'disable'}")
+        return text(out or f"Bluetooth {action}"), bool(rc)
+    if action in ("pair", "settings"):
+        # pairing needs the system UI: open it, then look with ui_elements and tap
+        # "Pair new device" and the device's name
+        out, rc = sh("am start -a android.settings.BLUETOOTH_SETTINGS")
+        return text("Bluetooth settings are open. Use ui_elements, tap 'Pair new device', then tap the "
+                    "device's name once it appears (the device must be in pairing mode). Press home when done."), bool(rc)
+    dump, _ = sh("dumpsys bluetooth_manager")
+    state = re.search(r"^\s*state: (\w+)", dump, re.M)
+    bonded = dump.split("Bonded devices:", 1)[1].split("\n\n", 1)[0].strip() if "Bonded devices:" in dump else ""
+    connected = sorted(set(re.findall(r"mCurrentDevice: ([0-9A-F:]{17})", dump)))
+    return text(f"Bluetooth: {state.group(1) if state else 'unknown'}\n"
+                f"Paired devices:\n{bonded or '(none)'}\n"
+                f"Playing audio to: {', '.join(connected) or 'nothing (the R1 speaker)'}"), False
+
+
+# ---- podcasts, radio and playback (the player lives in the voice server, which pauses it while you talk)
+
+def get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "claude-r1/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+def t_search_podcasts(a):
+    q = urllib.parse.quote(str(a["query"]))
+    found = get_json(f"https://itunes.apple.com/search?media=podcast&limit=6&term={q}").get("results", [])
+    if not found:
+        return text("No podcasts found."), False
+    return text("\n".join(f"{p.get('collectionName')} — {p.get('artistName')} | feed: {p.get('feedUrl')}"
+                           for p in found if p.get("feedUrl"))), False
+
+
+def t_podcast_episodes(a):
+    import xml.etree.ElementTree as ET
+    req = urllib.request.Request(str(a["feed_url"]), headers={"User-Agent": "claude-r1/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        root = ET.fromstring(r.read())
+    itunes = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
+    show = root.findtext("channel/title") or ""
+    lines = []
+    for item in root.iter("item"):
+        enc = item.find("enclosure")
+        if enc is None or not enc.get("url"):
+            continue
+        lines.append(f"{item.findtext('title')} | {item.findtext('pubDate', '')[:16]} | "
+                     f"{item.findtext(itunes + 'duration', '')} | audio: {enc.get('url')}")
+        if len(lines) >= int(a.get("count", 5)):
+            break
+    return text(f"{show}\n" + ("\n".join(lines) or "No playable episodes.")), False
+
+
+def t_search_radio(a):
+    q = urllib.parse.quote(str(a["query"]))
+    found = get_json(f"https://de1.api.radio-browser.info/json/stations/search?name={q}&limit=6"
+                     f"&hidebroken=true&order=clickcount&reverse=true")
+    if not found:
+        found = get_json(f"https://de1.api.radio-browser.info/json/stations/bytag/{q}?limit=6"
+                         f"&hidebroken=true&order=clickcount&reverse=true")
+    return text("\n".join(f"{s['name'].strip()} ({s.get('country', '')}, {s.get('tags', '')[:40]}) | "
+                           f"stream: {s['url_resolved']}" for s in found) or "No stations found."), False
+
+
+def media(cmd):
+    req = urllib.request.Request("http://127.0.0.1:8765/api/media", data=json.dumps(cmd).encode(),
+                                 method="POST", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+
+def t_play_audio(a):
+    r = media({"action": "play", "url": a["url"], "title": a.get("title", ""), "kind": a.get("kind", "audio")})
+    return text(r.get("message", "Playing.") + " Don't talk over it: reply in a few words."), not r.get("ok")
+
+
+def t_media_control(a):
+    action = str(a["action"]).lower()
+    r = media({"action": action, "value": a.get("value")})
+    if r.get("ok") or action not in ("pause", "resume", "next", "previous"):
+        return text(r.get("message", "Done.")), not r.get("ok")
+    # our player is idle: control whatever other app is playing (Spotify, Twelve, ...) with media keys
+    key = {"pause": "MEDIA_PAUSE", "resume": "MEDIA_PLAY", "next": "MEDIA_NEXT", "previous": "MEDIA_PREVIOUS"}[action]
+    out, rc = sh(f"input keyevent KEYCODE_{key}")
+    return text(out or f"Sent {action} to the playing app."), bool(rc)
+
+
+# ---- voice: Claude can pick its own ElevenLabs voice (voice-server reads ~/.config/r1/voice_id per reply)
+
+VOICE_FILE = os.path.join(CONF, "voice_id")
+
+
+def elevenlabs(path):
+    key = open(os.path.join(CONF, "elevenlabs_key")).read().strip()
+    req = urllib.request.Request("https://api.elevenlabs.io/v1" + path, headers={"xi-api-key": key})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+def voices():
+    return elevenlabs("/voices").get("voices", [])
+
+
+def t_list_voices(a):
+    try:
+        current = open(VOICE_FILE).read().strip()
+    except OSError:
+        current = "JBFqnCBsd6RMkjVDRZzb"
+    lines = []
+    for v in voices():
+        labels = v.get("labels") or {}
+        traits = ", ".join(x for x in (labels.get("gender"), labels.get("age"), labels.get("accent"),
+                                        labels.get("description") or labels.get("descriptive"),
+                                        labels.get("use_case") or labels.get("use case")) if x)
+        mark = "  <- current" if v.get("voice_id") == current else ""
+        lines.append(f"{v.get('name')} ({v.get('voice_id')}): {traits}{mark}")
+    return text("Voices available:\n" + "\n".join(lines)), False
+
+
+def t_set_voice(a):
+    want = str(a["voice"]).strip().lower()
+    match = next((v for v in voices() if want in (v.get("voice_id", "").lower(), v.get("name", "").lower())), None) or \
+        next((v for v in voices() if v.get("name", "").lower().startswith(want)), None)
+    if not match:
+        return text(f"No voice called '{a['voice']}'. Use list_voices."), True
+    os.makedirs(CONF, exist_ok=True)
+    with open(VOICE_FILE, "w") as f:
+        f.write(match["voice_id"])
+    return text(f"Voice set to {match['name']}. Your next spoken reply uses it."), False
+
+
+def t_shell(a):
+    out, rc = sh(a["command"], int(a.get("timeout", 30)))
+    return text(f"exit {rc}\n{out[-20000:]}"), False
+
+
+def t_device_status(a):
+    script = ("dumpsys battery | grep -E 'level|status|AC powered|USB powered';"
+              "echo screen: $(dumpsys power | grep -oE 'mWakefulness=[A-Za-z]+');"
+              "echo wifi: $(cmd wifi status 2>/dev/null | grep -oE 'SSID: [^,]+' | head -1);"
+              "echo ip: $(ip -4 -o addr show wlan0 | awk '{print $4}');"
+              "echo brightness: $(settings get system screen_brightness);"
+              "echo media_volume: $(cmd media_session volume --stream 3 --get 2>/dev/null | grep -oE 'volume is [0-9]+ in range \\[[0-9]+\\.\\.[0-9]+\\]');"
+              "echo foreground: $(dumpsys window | grep -oE 'mCurrentFocus=[^ ]+ [^ ]+ [^}]+' | head -1)")
+    out, _ = sh(script)
+    return text(out), False
+
+
+def t_notifications(a):
+    out, _ = sh("dumpsys notification --noredact", 20)
+    items, cur = [], None
+    for line in out.splitlines():
+        line = line.strip()
+        m = re.match(r"NotificationRecord\(0x[0-9a-f]+: pkg=(\S+)", line)
+        if m:
+            cur = {"app": m[1]}
+            items.append(cur)
+        elif cur is not None:
+            for key in ("android.title", "android.text", "android.bigText"):
+                m = re.match(re.escape(key) + r"=\S+ \((.*)\)$", line)
+                if m and key not in cur:
+                    cur[key] = m[1]
+    shown = [f"- {i['app']}: {i.get('android.title', '')} — {i.get('android.bigText') or i.get('android.text', '')}"
+             for i in items if i.get("android.title") or i.get("android.text")]
+    return text("\n".join(shown) or "No notifications."), False
+
+
+def photo_list(n):
+    out, _ = sh(f"ls -t {CAMERA_DIR} 2>/dev/null | grep -iE '\\.(jpe?g|png|heic)$' | head -{int(n)}")
+    return [f"{CAMERA_DIR}/{f}" for f in out.splitlines() if f.strip()]
+
+
+def photo_jpeg(path, max_side=1280):
+    """Fetch a photo from shared storage and shrink it to a JPEG Claude can take."""
+    out, rc = SH.run(f"base64 -w0 {q(path)}", 60)
+    if rc:
+        raise RuntimeError(out.decode(errors="replace"))
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = os.path.join(d, "in" + os.path.splitext(path)[1]), os.path.join(d, "out.jpg")
+        open(src, "wb").write(base64.b64decode(out.strip()))
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", src, "-vf",
+                        f"scale='min({max_side},iw)':'min({max_side},ih)':force_original_aspect_ratio=decrease",
+                        "-q:v", "4", dst], check=True)
+        return open(dst, "rb").read()
+
+
+def t_recent_photos(a):
+    paths = photo_list(a.get("count", 1))
+    if not paths:
+        return text(f"No photos in {CAMERA_DIR}."), False
+    content = []
+    for p in paths:
+        content += text(p) + image(photo_jpeg(p), "image/jpeg")
+    return content, False
+
+
+TOOLS = [
+    ("screenshot", "Capture the R1's screen (480x640). Use it to see what is on screen before tapping.",
+     {}, [], t_screenshot),
+    ("ui_elements", "List on-screen UI elements with their centre coordinates, type and label "
+     "(faster and more precise than reading a screenshot for finding buttons).", {}, [], t_ui_elements),
+    ("tap", "Tap the screen at pixel (x, y).", {"x": {"type": "integer"}, "y": {"type": "integer"}},
+     ["x", "y"], t_tap),
+    ("swipe", "Swipe from (x1,y1) to (x2,y2), e.g. to scroll. duration_ms defaults to 300.",
+     {"x1": {"type": "integer"}, "y1": {"type": "integer"}, "x2": {"type": "integer"},
+      "y2": {"type": "integer"}, "duration_ms": {"type": "integer"}}, ["x1", "y1", "x2", "y2"], t_swipe),
+    ("type_text", "Type text into the focused field; submit=true presses Enter afterwards.",
+     {"text": {"type": "string"}, "submit": {"type": "boolean"}}, ["text"], t_type_text),
+    ("press_key", "Press a key: " + ", ".join(KEYS) + ", or any Android KEYCODE_ name.",
+     {"key": {"type": "string"}}, ["key"], t_press_key),
+    ("list_apps", "List launchable apps (package names).", {}, [], t_list_apps),
+    ("open_app", "Open an app by package name or part of it (e.g. 'camera', 'settings', 'jelly').",
+     {"app": {"type": "string"}}, ["app"], t_open_app),
+    ("device_status", "Battery, charging, screen state, Wi-Fi, IP, brightness, volume, foreground app.",
+     {}, [], t_device_status),
+    ("notifications", "Read the current notifications.", {}, [], t_notifications),
+    ("recent_photos", "Get the most recent camera photos as images (count defaults to 1).",
+     {"count": {"type": "integer", "minimum": 1, "maximum": 5}}, [], t_recent_photos),
+    ("android_shell", "Run a command in an Android shell as the `shell` user (am, pm, settings, "
+     "dumpsys, input, cmd, screencap, ...). Returns exit code and output.",
+     {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"], t_shell),
+    ("take_photo", "Take a photo with the R1's camera (whatever it is pointing at). Use it when the user asks "
+     "you to take a picture or to look at something in front of them.", {}, [], t_take_photo),
+    ("open_url", "Open a web page in the browser on the device for the user to look at "
+     "(e.g. nytimes.com). Only when they want to see it; to answer a question, use WebFetch instead.",
+     {"url": {"type": "string"}}, ["url"], t_open_url),
+    ("vibrate", "Vibrate the R1: tap (subtle confirm), double (nudge), long, alert (urgent, three pulses), heartbeat. "
+     "Use it sparingly, e.g. to confirm something done silently or to get attention.",
+     {"pattern": {"type": "string", "enum": list(VIBRATIONS)}}, [], t_vibrate),
+    ("device_motion", "How the R1 is being held and moved right now (from its accelerometer and gravity sensor): "
+     "posture (upright in hand, lying face up/down, on its side...) and motion (still, in a hand, walking).",
+     {}, [], t_device_motion),
+    ("remember", "Store a lasting fact about the user so you know it in every future conversation: their name, "
+     "family and friends, home and work, routines, preferences, plans, things they asked you to remember. One short "
+     "fact per call, written in the third person (e.g. 'Dennison's sister is Maya, lives in Boston').",
+     {"fact": {"type": "string"}}, ["fact"], t_remember),
+    ("forget", "Remove stored facts: pass the fact's number from recall, or words it contains.",
+     {"fact": {"type": "string"}}, ["fact"], t_forget),
+    ("recall", "Refresh: list everything you currently know about the user (facts stored with remember).",
+     {}, [], t_recall),
+    ("bluetooth", "Bluetooth: action 'status' (on/off, paired devices, where audio goes), 'on', 'off', or "
+     "'pair' (opens Bluetooth settings so you can pair headphones/speakers by tapping; the device must be in "
+     "pairing mode). Audio follows a connected Bluetooth device automatically.",
+     {"action": {"type": "string", "enum": ["status", "on", "off", "pair"]}}, [], t_bluetooth),
+    ("search_podcasts", "Find podcasts by name or topic (Apple Podcasts directory). Returns show names and feed URLs.",
+     {"query": {"type": "string"}}, ["query"], t_search_podcasts),
+    ("podcast_episodes", "Latest episodes of a podcast feed (title, date, duration, audio URL), newest first.",
+     {"feed_url": {"type": "string"}, "count": {"type": "integer"}}, ["feed_url"], t_podcast_episodes),
+    ("search_radio", "Find internet radio stations by name or genre (e.g. 'WNYC', 'jazz', 'lofi'). Use for music "
+     "requests like 'play some jazz'.", {"query": {"type": "string"}}, ["query"], t_search_radio),
+    ("play_audio", "Play an audio URL on the R1 (podcast episode, radio stream, mp3). kind: podcast|radio|music. "
+     "It pauses automatically while the user talks to you and resumes after.",
+     {"url": {"type": "string"}, "title": {"type": "string"},
+      "kind": {"type": "string", "enum": ["podcast", "radio", "music"]}}, ["url"], t_play_audio),
+    ("media_control", "Control playback: pause, resume, stop, skip_forward / skip_back (seconds in value, default 30), "
+     "volume (value 0-100), status. pause/resume/next/previous also control other music apps (e.g. Spotify) "
+     "when nothing is playing here.",
+     {"action": {"type": "string", "enum": ["pause", "resume", "stop", "skip_forward", "skip_back", "volume",
+                                            "next", "previous", "status"]},
+      "value": {"type": "integer"}}, ["action"], t_media_control),
+    ("list_voices", "List the ElevenLabs voices you can speak with (name, id, gender/age/accent/style) and "
+     "which one is current.", {}, [], t_list_voices),
+    ("set_voice", "Change the voice you speak with, by name or voice id from list_voices. Use it when the "
+     "user asks for a different voice (e.g. 'sound more British', 'use a female voice') or names one.",
+     {"voice": {"type": "string"}}, ["voice"], t_set_voice),
+    ("show_card", "ALWAYS call this before your reply when the answer has glanceable data: "
+     "show a visual card on the R1's voice screen alongside your spoken reply. Cards fit weather, a flight, a stock, a short list (steps, results, schedule), "
+     "or a single key fact/number. Pass `card` with a `type` and that type's fields:\n"
+     "weather: place, temp (e.g. '68°'), condition (1-2 words, e.g. 'Light rain'), icon (sun|cloud|partly|rain|storm|snow|fog|wind|night), "
+     "high, low, forecast: [{label, icon, temp}] (up to 5 upcoming hours or days, not today again)\n"
+     "flight: airline, number, status (On time|Delayed|Boarding|Departed|Landed|Cancelled), "
+     "from: {code, city, time}, to: {code, city, time}, gate, terminal, progress (0-1 while airborne)\n"
+     "stock: symbol, name (short name, max 20 characters, e.g. 'Berkshire Hathaway'), price, change (e.g. '+1.24'), percent (e.g. '+0.8%'), points: [numbers, oldest first]\n"
+     "list: title, items: [{title, detail, value}] (up to 6; title, detail and value each under 30 characters)\n"
+     "fact: label, value (the big thing: a number, time, name), detail\n"
+     "html: title, html (self-contained HTML fragment with inline styles, no scripts; only when no other type fits)\n"
+     "Keep text short; the screen is 480x640. One card per answer.",
+     {"card": {"type": "object", "properties": {"type": {"type": "string", "enum": list(CARD_TYPES)}},
+               "required": ["type"], "additionalProperties": True}}, ["card"], t_show_card),
+]
+BY_NAME = {t[0]: t for t in TOOLS}
+
+
+# ---------------------------------------------------------------- MCP over HTTP
+
+def handle(msg):
+    method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if mid is None:                       # notification: nothing to answer
+        return None
+    if method == "initialize":
+        result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "r1-android", "version": "1.0"},
+                  "instructions": "Controls the Rabbit R1 Android device this session runs on. "
+                                  "Look (ui_elements or screenshot) before you tap."}
+    elif method == "ping":
+        result = {}
+    elif method == "tools/list":
+        result = {"tools": [{"name": n, "description": d,
+                             "inputSchema": {"type": "object", "properties": p, "required": r}}
+                            for n, d, p, r, _ in TOOLS]}
+    elif method == "tools/call":
+        tool = BY_NAME.get(params.get("name"))
+        if not tool:
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
+        try:
+            content, is_error = tool[4](params.get("arguments") or {})
+        except Exception as e:            # report tool failures to Claude instead of crashing
+            content, is_error = text(f"{type(e).__name__}: {e}"), True
+        result = {"content": content, "isError": is_error}
+    else:
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"no method {method}"}}
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body=None, headers=()):
+        data = json.dumps(body).encode() if body is not None else b""
+        self.send_response(code)
+        for k, v in headers:
+            self.send_header(k, v)
+        if body is not None:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        if self.path.rstrip("/") != "/mcp":
+            return self._send(404)
+        if self.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return self._send(401, {"error": "unauthorized"})
+        msg = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        replies = [r for r in map(handle, msg if isinstance(msg, list) else [msg]) if r]
+        if not replies:
+            return self._send(202)
+        self._send(200, replies if isinstance(msg, list) else replies[0],
+                   [("Mcp-Session-Id", self.headers.get("Mcp-Session-Id") or SESSION)])
+
+    def do_GET(self):
+        self._send(405)
+
+    def do_DELETE(self):
+        self._send(200, {})
+
+    def log_message(self, *a):
+        pass
+
+
+TOKEN, SESSION = token(), uuid.uuid4().hex
+
+if __name__ == "__main__":
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

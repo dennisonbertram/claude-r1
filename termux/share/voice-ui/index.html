@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=480, height=640, initial-scale=1, user-scalable=no">
+<title>Claude R1</title>
+<style>
+  @font-face { font-family: "Inter Tight"; src: url("/fonts/InterTight.woff2") format("woff2"); font-weight: 100 900; }
+  :root {
+    /* colour. Secondary text is a solid colour, never opacity: ink on orange tops out at 6.22:1 */
+    --orange: #ff5a1f; --ink: #120c08; --ink-2: #36180b;          /* 6.22 / 5.21 :1 on orange */
+    --night: #0b0a09; --paper: #fff; --paper-2: #b8b6b5;          /* paper-2: 9.6:1 on ink */
+    --surface: #22201e; --good: #3ddc84; --bad: #ff6b5b;
+    /* type: six sizes. fit() may only move between --t4 and --t3 */
+    --t1: 15px; --t2: 22px; --t3: 28px; --t4: 44px; --t5: 72px; --t6: 112px;
+    /* space */
+    --gutter: 26px; --s1: 4px; --s2: 8px; --s3: 16px; --top: 62px; --bottom: 72px;
+    /* radius */
+    --r1: 8px; --r2: 16px; --r3: 22px; --pill: 999px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; user-select: none; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: var(--orange); }
+  body { font-family: "Inter Tight", "Roboto", system-ui, sans-serif; color: var(--ink); transition: background .25s, color .25s; }
+  body.dark { background: var(--night); color: var(--paper); }
+
+  /* status row; it doubles as the one "island" slot for notices and the phone-controls warning */
+  .status { position: fixed; top: 0; left: 0; right: 0; height: var(--top); padding: 22px var(--gutter) 0; display: flex;
+    justify-content: space-between; align-items: flex-start; gap: var(--s2); z-index: 4;
+    font-size: var(--t1); font-weight: 800; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-2); }
+  body.dark .status { display: none; }
+  #st-right { white-space: nowrap; flex: none; }
+  .island { min-width: 0; flex-shrink: 1;
+    display: none; height: 40px; margin: -11px 0 0 -12px; padding: 0 14px; border-radius: var(--pill);
+    background: var(--ink); color: var(--paper); align-items: center; gap: var(--s2); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; letter-spacing: .08em; }
+  .island b { color: var(--orange); }
+  .island .it { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body.degraded .island, body.noticing .island, body.playing .island { display: inline-flex; }
+  body.playing #st-left { display: none; }
+  body.degraded #st-left, body.noticing #st-left, body.noticing #st-right { display: none; }
+  body.noticing .island { flex: 1; text-transform: none; letter-spacing: 0; font-size: var(--t2); font-weight: 750; }
+
+  .view { position: fixed; inset: 0; display: none; }
+  .view.on { display: block; }
+
+  /* ready: a clock, so waking the R1 lands on Claude rather than Android's lock screen */
+  .clock { position: absolute; left: var(--gutter); top: var(--top); font-size: var(--t6); line-height: .9; font-weight: 800;
+    letter-spacing: -.06em; }
+  .clock .m { font-variant-numeric: tabular-nums; }
+  .date { position: absolute; left: var(--gutter); right: var(--gutter); top: calc(var(--top) + 112px);
+    font-size: var(--t2); font-weight: 700; color: var(--ink-2); }
+  .big { position: absolute; left: var(--gutter); right: var(--gutter); bottom: 96px; font-size: var(--t4); line-height: .95;
+    font-weight: 800; letter-spacing: -.04em; }
+  .foot { position: fixed; left: var(--gutter); right: var(--gutter); bottom: 34px; font-size: var(--t2); font-weight: 700;
+    color: var(--ink-2); display: flex; justify-content: space-between; z-index: 2; font-variant-numeric: tabular-nums; }
+  body.dark .foot { color: var(--paper-2); }
+  .foot .rec { color: var(--orange); }
+
+  /* conversation */
+  .convo { position: absolute; top: var(--top); left: var(--gutter); right: var(--gutter); bottom: var(--bottom); overflow: hidden; }
+  .convo .scroller { position: absolute; inset: 0; overflow-y: auto; scrollbar-width: none; scroll-behavior: smooth; }
+  .convo .scroller::-webkit-scrollbar { display: none; }
+  .convo.carded:not(.expanded) .scroller { overflow: hidden; }
+  .convo.carded .a { font-size: var(--t3); line-height: 1.12; letter-spacing: -.02em; }
+  .convo.carded:not(.expanded) .a { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
+  .q { font-size: var(--t2); line-height: 1.2; font-weight: 650; color: var(--ink-2); margin-bottom: var(--s3); }
+  .a { font-size: var(--t4); line-height: 1.04; font-weight: 800; letter-spacing: -.03em; white-space: pre-wrap; }
+  .photo { width: 100%; height: 30vh; object-fit: cover; border-radius: var(--r3); display: block; margin-bottom: var(--s3);
+    background: rgba(0,0,0,.15); }
+  /* position indicator for the scroll wheel (instead of a ▼ that looks like a button) */
+  .pos { position: fixed; right: 9px; top: calc(var(--top) + 8px); bottom: calc(var(--bottom) + 8px); width: 4px;
+    border-radius: var(--pill); background: rgba(18,12,8,.18); display: none; }
+  .pos i { position: absolute; left: 0; right: 0; border-radius: var(--pill); background: var(--ink); }
+
+  /* cards Claude draws with the show_card tool */
+  .card { background: var(--ink); color: var(--paper); border-radius: var(--r3); padding: var(--s3) 20px; margin-bottom: var(--s3); }
+  .card .k { font-size: var(--t1); font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--paper-2); }
+  .card .row { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
+  .card .row > div:first-child { min-width: 0; }
+  .card .row > .k:first-child { flex: none; }                 /* a stock symbol is never squeezed by a long name */
+  .card .k.nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: none; letter-spacing: 0; }
+  .card .hero { font-size: var(--t5); line-height: .95; font-weight: 800; letter-spacing: -.05em; font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; margin-top: var(--s1); }
+  .card .sub { font-size: var(--t2); font-weight: 700; color: var(--paper-2); margin-top: var(--s1); }
+  .card .accent { color: var(--orange); }
+  .card .city { color: var(--paper-2); }
+  .card svg.ic { width: 64px; height: 64px; flex: none; }
+  .card .wx { display: flex; justify-content: space-between; gap: var(--s2); }
+  .card .wx .cond { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .wx .hl { flex: none; white-space: nowrap; color: var(--paper); }
+  .card .fc { display: grid; grid-template-columns: repeat(var(--n), 1fr); margin-top: var(--s3); padding-top: var(--s3);
+    border-top: 2px solid rgba(255,255,255,.12); }
+  .card .fc div { text-align: center; font-size: var(--t2); font-weight: 800; }
+  .card .fc b { display: block; font-size: var(--t1); letter-spacing: .1em; text-transform: uppercase; color: var(--paper-2); }
+  .card .fc svg { width: 30px; height: 30px; display: block; margin: var(--s1) auto; }
+  .card .codes { font-size: var(--t4); font-weight: 800; letter-spacing: -.04em; }
+  .card .pill { font-size: var(--t1); font-weight: 800; padding: 6px 12px; border-radius: var(--pill); background: var(--orange);
+    color: var(--ink); white-space: nowrap; }
+  .card .pill.bad { background: #ff4d4d; color: var(--ink); }
+  .card .pill.good { background: var(--good); color: var(--ink); }
+  .card .track { position: relative; height: 4px; background: rgba(255,255,255,.18); border-radius: var(--pill); margin: var(--s3) var(--s2); }
+  .card .track i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--orange); border-radius: var(--pill); }
+  .card .track b { position: absolute; top: -11px; font-size: var(--t2); line-height: 1; transform: translateX(-50%) rotate(90deg); color: var(--orange); }
+  .card .up { color: var(--good); } .card .down { color: var(--bad); }
+  .card svg.spark { width: 100%; height: 64px; display: block; margin-top: var(--s2); }
+  .card ul { list-style: none; margin-top: var(--s2); }
+  .card li { display: flex; justify-content: space-between; gap: var(--s3); padding: var(--s2) 0; border-top: 2px solid rgba(255,255,255,.1); }
+  .card li:first-child { border-top: 0; }
+  .card li .t { font-size: var(--t2); font-weight: 750; line-height: 1.15; }
+  .card li .d { font-size: var(--t1); font-weight: 650; color: var(--paper-2); margin-top: 2px; }
+  .card li .v { font-size: var(--t2); font-weight: 800; color: var(--orange); white-space: nowrap; }
+  .card li.more-n { font-size: var(--t1); font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--paper-2); }
+  .card.dense li .d { display: none; }
+  .card iframe { width: 100%; height: 36vh; border: 0; border-radius: var(--r1); background: #fff; pointer-events: none; }
+
+  /* listening: the word says what's happening; the elapsed time is secondary (bottom right) */
+  canvas.wave { position: absolute; left: 0; top: 20vh; width: 100vw; height: 46vh; }
+  .heard { position: absolute; left: var(--gutter); top: 64px; font-size: var(--t4); font-weight: 800; letter-spacing: -.035em; color: var(--paper); }
+
+  /* thinking; "hearing you" shows dots instead of the spinner */
+  #thinking.on { display: flex; flex-direction: column; padding: var(--top) var(--gutter) 76px; }
+  #thinking .q { flex: none; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .spinbox { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; }
+  .spin { width: 120px; height: 120px; border-radius: 50%;
+    border: 12px solid rgba(18,12,8,.15); border-top-color: var(--ink); animation: rot 1s linear infinite; }
+  .dots { display: none; gap: 14px; height: 120px; align-items: center; }
+  .dots i { width: 22px; height: 22px; border-radius: 50%; background: var(--ink); animation: blink 1.2s infinite; }
+  .dots i:nth-child(2) { animation-delay: .2s; } .dots i:nth-child(3) { animation-delay: .4s; }
+  #thinking.hearing .spin { display: none; } #thinking.hearing .dots { display: flex; }
+  .tool { min-height: 1.2em; text-align: center; font-size: var(--t2); font-weight: 750; color: var(--ink); }
+
+  /* long-press menu: an action sheet. Start over is destructive (red, two taps); Close is its own group */
+  .menu { position: fixed; inset: 0; background: var(--night); color: var(--paper); display: none; flex-direction: column;
+    padding: var(--gutter); gap: var(--s3); z-index: 10; }
+  .menu.on { display: flex; }
+  .menu button { flex: 1; border: 0; border-radius: var(--r3); background: var(--surface); color: var(--paper);
+    font: 800 var(--t3)/1 "Inter Tight", system-ui, sans-serif; letter-spacing: -.02em; text-align: left; padding: 0 var(--gutter); }
+  .menu button.danger { color: var(--bad); }
+  .menu button.danger.armed { background: var(--bad); color: var(--ink); }
+  .menu button.close { margin-top: calc(var(--gutter) - var(--s3)); text-align: center; color: var(--paper-2); }
+  .menu button:active { transform: scale(.98); filter: brightness(1.2); }
+
+  .press { position: fixed; inset: 0; background: rgba(0,0,0,.08); opacity: 0; pointer-events: none; transition: opacity .1s; z-index: 5; }
+  .press.on { opacity: 1; }
+  @keyframes rot { to { transform: rotate(360deg) } }
+  @keyframes blink { 0%, 100% { opacity: .25 } 40% { opacity: 1 } }
+</style>
+</head>
+<body>
+  <div class="status"><span id="st-left">Claude</span><span class="island" id="island"></span><span id="st-right"></span></div>
+
+  <section class="view on" id="ready">
+    <div class="clock" id="clock"><span id="ch"></span>:<span class="m" id="cm"></span></div>
+    <div class="date" id="date"></div>
+    <div class="big">Hold the<br>button to talk.</div>
+  </section>
+
+  <section class="view" id="listening">
+    <div class="heard">Listening</div>
+    <canvas class="wave" width="480" height="300"></canvas>
+  </section>
+
+  <section class="view" id="thinking">
+    <div class="q" id="think-q"></div>
+    <div class="spinbox"><div class="spin"></div><div class="dots"><i></i><i></i><i></i></div><div class="tool" id="tool"></div></div>
+  </section>
+
+  <section class="view" id="answer">
+    <div class="convo"><div class="scroller" id="scroller">
+      <img class="photo" id="photo" alt="">
+      <div id="card"></div>
+      <div class="q" id="ans-q"></div>
+      <div class="a" id="ans-a"></div>
+    </div></div>
+  </section>
+  <div class="pos" id="pos"><i></i></div>
+
+  <div class="foot"><span id="foot">or tap anywhere</span><span id="foot-r"></span></div>
+  <div class="press" id="press"></div>
+
+  <div class="menu" id="menu">
+    <button class="danger" data-act="new">Start over</button>
+    <button data-act="home">Apps</button>
+    <button data-act="settings">Settings</button>
+    <button data-act="terminal">Terminal</button>
+    <button class="close" data-act="close">Close</button>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+const bridge = window.R1 || null;          // Java bridge from the launcher app (absent in a browser)
+let S = { state: "ready" };                // last state from the server
+let levels = [], recStart = 0, bootId = null, failures = 0;
+
+// ---------------------------------------------------------------- rendering
+
+function show(view) {
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.id === view));
+}
+
+function fit(el, max, min) {
+  // shrink a plain answer until it fits the box, down to `min` (between --t4 and --t3); beyond that it scrolls
+  const box = $("scroller");
+  for (let s = max; s >= min; s -= 2) {
+    el.style.fontSize = s + "px";
+    if (box.scrollHeight <= box.clientHeight) break;
+  }
+}
+
+function resetLayout() {
+  // undo what fit() and wholeLines() left inline, so every answer is laid out from the stylesheet's box
+  $("scroller").style.height = "";
+  $("scroller").style.bottom = "";
+  $("ans-a").style.fontSize = "";
+}
+
+function wholeLines() {
+  // a plain answer that still scrolls shows whole lines only: trim the box to a multiple of the line height
+  const box = $("scroller"), a = $("ans-a");
+  if (box.scrollHeight <= box.clientHeight) return;
+  const lh = parseFloat(getComputedStyle(a).lineHeight), top = a.offsetTop;
+  box.style.bottom = "auto";
+  box.style.height = top + Math.floor((box.parentNode.clientHeight - top) / lh) * lh + "px";
+}
+
+function fitCard() {
+  // card answers never scroll at rest: shrink a too-wide hero, drop list details, then rows ("+N more"),
+  // and clamp the caption to the whole lines left under the card. The wheel expands it all.
+  const convo = document.querySelector(".convo"), box = $("scroller"), a = $("ans-a");
+  if (convo.classList.contains("expanded")) return;
+  const card = box.querySelector(".card"), photo = $("photo").style.display === "none" ? null : $("photo");
+  const lh = parseFloat(getComputedStyle(a).lineHeight), gap = 16;
+  a.style.webkitLineClamp = "unset";
+  if (card) {
+    card.querySelectorAll(".hero, .codes").forEach(h => {
+      h.style.fontSize = "";
+      h.style.whiteSpace = "";
+      if (h.scrollWidth > h.clientWidth) h.style.fontSize = "var(--t4)";
+      if (h.scrollWidth > h.clientWidth) h.style.whiteSpace = "normal";    // still too long: wrap
+    });
+    const budget = box.clientHeight - (photo ? photo.offsetHeight + gap : 0) - (a.textContent ? lh + gap : 0);
+    const ul = card.querySelector("ul");
+    if (ul && card.offsetHeight > budget) {
+      card.classList.add("dense");
+      convo.dataset.trimmed = "1";                 // the wheel brings the details back
+      const total = ul.querySelectorAll("li:not(.more-n)").length;
+      let more = null;
+      while (card.offsetHeight > budget && ul.querySelectorAll("li:not(.more-n)").length > 1) {
+        [...ul.querySelectorAll("li:not(.more-n)")].pop().remove();
+        more = more || ul.appendChild(Object.assign(document.createElement("li"), { className: "more-n" }));
+        more.textContent = `+${total - ul.querySelectorAll("li:not(.more-n)").length} more`;
+      }
+    }
+  }
+  const room = box.clientHeight - (a.offsetTop - box.offsetTop);
+  a.style.webkitLineClamp = Math.max(1, Math.floor(room / lh));
+}
+
+function updateMore() {
+  const convo = document.querySelector(".convo"), b = $("scroller"), a = $("ans-a");
+  const scrolls = b.scrollTop + b.clientHeight < b.scrollHeight - 4;
+  const clamped = convo.classList.contains("carded") && !convo.classList.contains("expanded") &&
+    (a.scrollHeight > a.clientHeight + 1 || convo.dataset.trimmed);
+  const pos = $("pos");
+  pos.style.display = $("answer").classList.contains("on") && (scrolls || clamped) ? "block" : "none";
+  const f = b.scrollHeight ? Math.min(1, b.clientHeight / b.scrollHeight) : 1;
+  pos.firstChild.style.height = (clamped && f > .99 ? 60 : f * 100) + "%";
+  pos.firstChild.style.top = (b.scrollTop / (b.scrollHeight || 1)) * 100 + "%";
+}
+
+const IDLE_S = 180, ERROR_IDLE_S = 20;   // after this long untouched, waking shows the clock again
+let lastState = null, lastReply = null, noticeTimer = null;
+
+function idle() {
+  // an old answer (or error) gives way to the clock; Claude still remembers the conversation
+  if (S.state !== "answer") return false;
+  const age = Date.now() / 1000 - (S.now || 0);
+  return age > (S.error ? ERROR_IDLE_S : IDLE_S);
+}
+
+function render() {
+  const st = S.state, busy = ["listening", "transcribing", "thinking", "speaking"].includes(st);
+  document.body.classList.toggle("dark", st === "listening");
+  bridge && bridge.keepAwake && bridge.keepAwake(busy);
+  if (st === "listening" && lastState !== "listening" && S.ptt) bridge && bridge.haptic && bridge.haptic();
+  lastState = st;
+  showNotice(S.notice, S.notice_id);
+  renderIsland();
+  tick();
+  $("pos").style.display = "none";
+
+  if (st === "listening") {
+    show("listening");
+    $("foot").innerHTML = '<span class="rec">●</span> ' +
+      (S.auto ? "Stops when you pause" : S.ptt ? "Let go to send" : "Tap anywhere to send");
+    recStart = S.since ? Date.now() - (S.now - S.since) * 1000 : Date.now();
+    return;
+  }
+  if (st === "transcribing" || st === "thinking") {
+    show("thinking");
+    $("st-right").style.visibility = "visible";
+    $("st-left").textContent = st === "transcribing" ? "Hearing you" : "Thinking";
+    $("thinking").classList.toggle("hearing", st === "transcribing");
+    $("foot-r").textContent = "";
+    $("think-q").textContent = S.you || "";
+    $("tool").textContent = S.warming && !S.tool ? "Waking Claude up…" : (S.tool || "");
+    $("foot").textContent = "Tap to cancel";
+    return;
+  }
+  if ((!S.reply && !S.photo && !S.error) || idle()) {
+    show("ready");
+    $("st-left").textContent = "Claude";
+    $("st-right").style.visibility = "hidden";       // the big clock already says it
+    $("foot").textContent = "or tap anywhere";
+    $("foot-r").textContent = "";
+    return;
+  }
+  show("answer");
+  $("st-right").style.visibility = "visible";
+  $("st-left").textContent = st === "speaking" ? "Speaking" : "Claude";
+  const carded = !!(S.card || S.photo);
+  $("ans-q").textContent = S.you || "";
+  $("ans-q").style.display = S.you && !carded ? "block" : "none";
+  const img = $("photo");
+  if (S.photo) { if (img.getAttribute("src") !== S.photo) img.src = S.photo; img.style.display = "block"; }
+  else img.style.display = "none";
+  const key = (S.you || "") + "|" + (S.reply || S.error || "") + "|" + JSON.stringify(S.card || null);
+  const convo = document.querySelector(".convo");
+  if (key !== lastReply) {                       // a new answer: collapse, re-fit, back to the top
+    convo.classList.remove("expanded");
+    convo.dataset.trimmed = "";
+    lastCard = "";
+    wheelTo = null;
+    $("scroller").scrollTop = 0;
+    lastReply = key;
+  }
+  renderCard(S.card);
+  $("ans-a").textContent = S.error ? S.error : (S.reply || "");
+  convo.classList.toggle("carded", carded);
+  $("foot-r").textContent = "";
+  const keep = $("scroller").scrollTop;
+  resetLayout();
+  if (!carded) { fit($("ans-a"), 44, 28); wholeLines(); } else fitCard();
+  $("scroller").scrollTop = keep;                 // re-rendering the same answer keeps your place
+  $("foot").textContent = S.retry && S.error ? "Tap to try again" : "Tap to reply";
+  requestAnimationFrame(updateMore);
+}
+
+let noticeText = "", lastNotice = "";
+function showNotice(text, id) {
+  if (!text || (id || text) === lastNotice) return;
+  lastNotice = id || text;
+  noticeText = text;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { noticeText = ""; renderIsland(); }, 6000);
+}
+
+function renderIsland() {
+  // one slot in the status row: a passing notice outranks the phone-controls warning
+  const st = S.state, calm = st === "ready" || st === "answer";
+  const offline = S.online === false && calm, controlsOff = !S.controls && calm && bootAge() > 30;
+  document.body.classList.toggle("noticing", !!noticeText);
+  document.body.classList.toggle("degraded", (offline || controlsOff) && !noticeText);
+  document.body.classList.toggle("controls-off", controlsOff && !offline && !noticeText);
+  const media = S.media && calm && !noticeText && !offline && !controlsOff ? S.media : null;
+  document.body.classList.toggle("playing", !!media);
+  $("island").innerHTML = noticeText ? `<span class="it">${esc(noticeText)}</span>`
+    : offline ? "<b>●</b> Offline" : controlsOff ? "<b>●</b> Phone controls off · Fix"
+    : media ? `<b>${media.playing ? "♪" : "❚❚"}</b><span class="it">${esc(media.title || "Playing")}</span>` : "";
+}
+
+let bootSeen = Date.now();
+const bootAge = () => (Date.now() - bootSeen) / 1000;   // give the button watcher time to connect
+
+// ---------------------------------------------------------------- clock
+
+function tick() {
+  const d = new Date();
+  $("st-right").textContent = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const [h, m] = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(/\s?[AP]M$/i, "").split(":");
+  if ($("ch").textContent !== h) { $("ch").textContent = h; trimClock(); }
+  $("cm").textContent = m;
+  $("date").textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+}
+// put the clock's ink (not its glyph box) on the gutter: shift by the first digit's left side bearing
+const measure = document.createElement("canvas").getContext("2d");
+function trimClock() {
+  measure.font = `800 ${getComputedStyle($("clock")).fontSize} "Inter Tight"`;
+  const m = measure.measureText($("ch").textContent[0] || "1");
+  $("clock").style.marginLeft = m.actualBoundingBoxLeft + "px";
+}
+document.fonts.ready.then(() => { trimClock(); render(); });
+tick();
+setInterval(() => (S.state === "answer" || S.state === "ready" ? render() : (tick(), renderIsland())), 5000);
+
+// ---------------------------------------------------------------- cards (Claude's show_card tool)
+
+const esc = v => String(v ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const ICONS = {
+  sun: '<circle cx="32" cy="32" r="12" fill="#ff5a1f"/><g stroke="#ff5a1f" stroke-width="5" stroke-linecap="round"><path d="M32 6v7M32 51v7M6 32h7M51 32h7M13.6 13.6l5 5M45.4 45.4l5 5M13.6 50.4l5-5M45.4 18.6l5-5"/></g>',
+  night: '<path d="M40 8a24 24 0 1 0 16 38A20 20 0 0 1 40 8z" fill="#ff5a1f"/>',
+  cloud: '<path d="M18 48h30a11 11 0 0 0 0-22 15 15 0 0 0-29-2A12 12 0 0 0 18 48z" fill="#fff"/>',
+  partly: '<circle cx="24" cy="22" r="10" fill="#ff5a1f"/><path d="M20 52h28a10 10 0 0 0 0-20 14 14 0 0 0-27-2 11 11 0 0 0-1 22z" fill="#fff"/>',
+  rain: '<path d="M18 38h30a10 10 0 0 0 0-20 14 14 0 0 0-27-2 11 11 0 0 0-3 22z" fill="#fff"/><g stroke="#ff5a1f" stroke-width="4" stroke-linecap="round"><path d="M22 46l-3 8M34 46l-3 8M46 46l-3 8"/></g>',
+  storm: '<path d="M18 36h30a10 10 0 0 0 0-20 14 14 0 0 0-27-2 11 11 0 0 0-3 22z" fill="#fff"/><path d="M34 38l-8 12h8l-4 10 12-15h-8l4-7z" fill="#ff5a1f"/>',
+  snow: '<path d="M18 38h30a10 10 0 0 0 0-20 14 14 0 0 0-27-2 11 11 0 0 0-3 22z" fill="#fff"/><g fill="#ff5a1f"><circle cx="22" cy="50" r="3.5"/><circle cx="34" cy="55" r="3.5"/><circle cx="46" cy="50" r="3.5"/></g>',
+  fog: '<g stroke="#fff" stroke-width="5" stroke-linecap="round"><path d="M10 24h44M16 34h38M10 44h40"/></g>',
+  wind: '<g stroke="#fff" stroke-width="5" stroke-linecap="round" fill="none"><path d="M8 26h32a7 7 0 1 0-7-7M8 38h42a7 7 0 1 1-7 7"/></g>',
+};
+const icon = (name, cls) => `<svg class="${cls || "ic"}" viewBox="0 0 64 64">${ICONS[name] || ICONS[guessIcon(name)]}</svg>`;
+const guessIcon = t => {
+  t = String(t || "").toLowerCase();
+  return /thunder|storm/.test(t) ? "storm" : /snow|sleet/.test(t) ? "snow" : /rain|shower|drizzle/.test(t) ? "rain"
+    : /fog|mist|haze/.test(t) ? "fog" : /wind/.test(t) ? "wind" : /partly|mostly sunny|few/.test(t) ? "partly"
+    : /cloud|overcast/.test(t) ? "cloud" : /night|clear night/.test(t) ? "night" : "sun";
+};
+
+function spark(points) {
+  const p = (points || []).map(Number).filter(n => isFinite(n));
+  if (p.length < 2) return "";
+  const lo = Math.min(...p), hi = Math.max(...p), w = 300, h = 70;
+  const xy = p.map((v, i) => `${(i / (p.length - 1)) * w},${h - 4 - ((v - lo) / (hi - lo || 1)) * (h - 8)}`);
+  const col = p[p.length - 1] >= p[0] ? "#3ddc84" : "#ff6b5b";
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${xy.join(" ")}"
+    fill="none" stroke="${col}" stroke-width="4" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+const CARDS = {
+  weather: c => {
+    const today = new Date().toLocaleDateString("en-US", { weekday: "short" }).toLowerCase();
+    const fc = (c.forecast || []).filter(f => {           // today's numbers are already up top
+      const l = String(f.label || "").trim().toLowerCase();
+      return !/^(today|now|tonight)$/.test(l) && !l.startsWith(today);
+    }).slice(0, 5);
+    const hl = [c.high && "H:" + esc(c.high), c.low && "L:" + esc(c.low)].filter(Boolean).join(" ");
+    return `
+    <div class="k">${esc(c.place || "Weather")}</div>
+    <div class="row"><div class="hero">${esc(c.temp)}</div>${icon(c.icon || c.condition)}</div>
+    <div class="sub wx"><span class="cond">${esc(c.condition)}</span>${hl ? `<span class="hl">${hl}</span>` : ""}</div>
+    ${fc.length >= 2 ? `<div class="fc" style="--n:${fc.length}">${fc.map(f =>
+      `<div><b>${esc(f.label)}</b>${icon(f.icon || f.condition, "")}${esc(f.temp)}</div>`).join("")}</div>` : ""}`;
+  },
+  flight: c => {
+    const bad = /delay|cancel|divert/i.test(c.status || ""), good = /on time|landed|arrived|departed|boarding/i.test(c.status || ""), pr = Math.max(0, Math.min(1, Number(c.progress) || 0));
+    const f = c.from || {}, t = c.to || {};
+    return `
+    <div class="row"><div class="k">${esc(c.airline)} ${esc(c.number)}</div>${c.status ? `<span class="pill ${bad ? "bad" : good ? "good" : ""}">${esc(c.status)}</span>` : ""}</div>
+    <div class="row" style="margin-top:var(--s2)"><div class="codes">${esc(f.code)}</div><div class="codes accent">→</div><div class="codes">${esc(t.code)}</div></div>
+    ${c.progress != null ? `<div class="track"><i style="width:${pr * 100}%"></i><b style="left:${pr * 100}%">✈</b></div>` : ""}
+    <div class="row"><div class="sub">${esc(f.time)}<br><span class="city">${esc(f.city)}</span></div>
+      <div class="sub" style="text-align:right">${esc(t.time)}<br><span class="city">${esc(t.city)}</span></div></div>
+    ${c.gate || c.terminal ? `<div class="sub" style="margin-top:var(--s2)">${c.terminal ? "Terminal " + esc(c.terminal) : ""}${c.gate && c.terminal ? " · " : ""}${c.gate ? "Gate " + esc(c.gate) : ""}</div>` : ""}`;
+  },
+  stock: c => {
+    const dn = /^-|−/.test(String(c.change || c.percent || ""));
+    return `
+    <div class="row"><div class="k">${esc(c.symbol)}</div><div class="k nm">${esc(c.name)}</div></div>
+    <div class="hero">${esc(c.price)}</div>
+    <div class="sub ${dn ? "down" : "up"}">${esc(c.change)} ${c.percent ? `(${esc(c.percent)})` : ""}</div>
+    ${spark(c.points)}`;
+  },
+  list: c => `
+    ${c.title ? `<div class="k">${esc(c.title)}</div>` : ""}
+    <ul>${(c.items || []).slice(0, 6).map(i => `<li><div><div class="t">${esc(i.title)}</div>${i.detail ? `<div class="d">${esc(i.detail)}</div>` : ""}</div>${i.value ? `<div class="v">${esc(i.value)}</div>` : ""}</li>`).join("")}</ul>`,
+  fact: c => `
+    <div class="k">${esc(c.label)}</div>
+    <div class="hero accent">${esc(c.value)}</div>
+    ${c.detail ? `<div class="sub">${esc(c.detail)}</div>` : ""}`,
+  html: c => `
+    ${c.title ? `<div class="k" style="margin-bottom:var(--s2)">${esc(c.title)}</div>` : ""}
+    <iframe sandbox="" srcdoc="${esc('<meta name=viewport content="width=device-width"><body style="margin:0;font-family:system-ui,sans-serif">' + (c.html || ""))}"></iframe>`,
+};
+
+let lastCard = "";
+function renderCard(card) {
+  const key = JSON.stringify(card || null);
+  if (key === lastCard) return;
+  lastCard = key;
+  const make = card && CARDS[card.type];
+  $("card").innerHTML = make ? `<div class="card">${make(card)}</div>` : "";
+}
+
+// ---------------------------------------------------------------- waveform
+
+const cv = document.querySelector("canvas.wave"), ctx = cv.getContext("2d");
+function drawWave() {
+  if (S.state === "listening") {
+    const s = Math.floor((Date.now() - recStart) / 1000);
+    $("foot-r").textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    const mid = cv.height / 2, n = 40, step = cv.width / n, hist = levels.slice(-n);
+    ctx.fillStyle = "#ff5a1f";
+    hist.forEach((lv, i) => {
+      const x = cv.width - (hist.length - i) * step + step / 2, h = Math.max(8, lv * cv.height * .92);
+      ctx.beginPath(); ctx.roundRect(x - 4.5, mid - h / 2, 9, h, 4.5); ctx.fill();
+    });
+  }
+  requestAnimationFrame(drawWave);
+}
+drawWave();
+
+// ---------------------------------------------------------------- server
+
+function post(path) { return fetch(path, { method: "POST" }).catch(() => {}); }
+
+function connect() {
+  const es = new EventSource("/api/events");
+  es.addEventListener("state", e => {
+    S = JSON.parse(e.data);
+    if (bootId && S.boot !== bootId) return location.reload();   // server restarted: load fresh UI
+    if (!bootId) bootSeen = Date.now();
+    bootId = S.boot;
+    render();
+  });
+  es.addEventListener("level", e => { levels.push(...JSON.parse(e.data)); levels = levels.slice(-200); });
+  es.onopen = () => { failures = 0; };
+  es.onerror = () => {
+    es.close();
+    // the server is gone (crashed or killed): let the launcher show its starting page and restart it
+    if (++failures >= 3 && bridge && bridge.serverDown) return bridge.serverDown();
+    setTimeout(connect, 1500);
+  };
+}
+connect();
+
+// ---------------------------------------------------------------- input: tap = talk, hold = menu
+
+let holdTimer = null, held = false;
+document.addEventListener("pointerdown", e => {
+  if ($("menu").classList.contains("on")) return;
+  held = false;
+  $("press").classList.add("on");
+  holdTimer = setTimeout(() => { held = true; $("press").classList.remove("on"); openMenu(); }, 650);
+});
+document.addEventListener("pointerup", e => {
+  $("press").classList.remove("on");
+  clearTimeout(holdTimer);
+  if (held || $("menu").classList.contains("on")) return;
+  bridge && bridge.haptic && bridge.haptic();
+  if (document.body.classList.contains("playing") && e.clientY < 62)      // the status row: pause / resume
+    return fetch("/api/media", { method: "POST", body: JSON.stringify({ action: S.media.playing ? "pause" : "resume" }) });
+  if (document.body.classList.contains("controls-off") && e.clientY < 62) {   // the status row: fix phone controls
+    showNotice("Reconnecting phone controls…", "fix" + Date.now()); renderIsland();
+    fetch("/api/fix", { method: "POST" }).then(r => r.json()).then(r => {
+      if (!r.ok) { noticeText = ""; renderIsland(); bridge && bridge.openApp("moe.shizuku.privileged.api"); }
+    }).catch(() => {});
+    return;
+  }
+  if (S.state === "answer" && S.retry && S.error && !idle()) return post("/api/retry");
+  if (S.state === "listening") { levels = []; post("/api/talk"); }
+  else if (S.state === "transcribing" || S.state === "thinking") post("/api/cancel");
+  else if (S.state === "speaking") { levels = []; post("/api/talk"); }   // interrupt and reply in one tap
+  else { levels = []; post("/api/talk"); }
+});
+document.addEventListener("pointercancel", () => { $("press").classList.remove("on"); clearTimeout(holdTimer); });
+
+let armTimer = null;
+function disarm() {
+  const b = document.querySelector(".menu .danger");
+  b.classList.remove("armed"); b.textContent = "Start over"; clearTimeout(armTimer);
+}
+function openMenu() { disarm(); bridge && bridge.haptic && bridge.haptic(); $("menu").classList.add("on"); }
+$("menu").addEventListener("click", e => {
+  const b = e.target.closest("button"), act = b && b.dataset.act;
+  if (!act) return;
+  if (act === "new" && !b.classList.contains("armed")) {     // forgetting the conversation takes two taps
+    b.classList.add("armed"); b.textContent = "Tap again to forget";
+    bridge && bridge.haptic && bridge.haptic();
+    armTimer = setTimeout(disarm, 4000);
+    return;
+  }
+  disarm();
+  $("menu").classList.remove("on");
+  if (act === "new") { post("/api/new"); showNotice("New conversation", "new" + Date.now()); renderIsland(); }
+  else if (act === "home" && bridge) bridge.openApp("fr.neamar.kiss") || bridge.openSettings();   // KISS, else Settings
+  else if (act === "settings" && bridge) bridge.openSettings();
+  else if (act === "terminal" && bridge) bridge.openTermux();
+});
+
+// scroll wheel (forwarded by the launcher) scrolls a long answer
+let wheelTo = null, wheelAt = 0;   // the last wheel target: quick clicks build on it, not on a half-finished smooth scroll
+window.r1Key = dir => {
+  const convo = document.querySelector(".convo"), b = $("scroller");
+  const from = wheelTo !== null && Date.now() - wheelAt < 400 ? wheelTo : b.scrollTop;
+  if (convo.classList.contains("carded")) {
+    if (dir === "down" && !convo.classList.contains("expanded")) {     // first turn: show everything
+      convo.classList.add("expanded"); $("ans-a").style.webkitLineClamp = "unset";
+      if (convo.dataset.trimmed) { lastCard = ""; renderCard(S.card); convo.dataset.trimmed = ""; }
+      return setTimeout(updateMore, 50);
+    }
+    if (dir === "up" && convo.classList.contains("expanded") && from === 0) {
+      convo.classList.remove("expanded"); lastCard = ""; renderCard(S.card); fitCard();
+      return setTimeout(updateMore, 50);
+    }
+  }
+  const a = $("ans-a"), lh = parseFloat(getComputedStyle(a).lineHeight) || 40, top = a.offsetTop;
+  const lines = Math.round((from - top) / lh) + (dir === "down" ? 3 : -3);
+  wheelTo = Math.max(0, Math.min(top + lines * lh, b.scrollHeight - b.clientHeight));   // a line boundary, never mid-line
+  wheelAt = Date.now();
+  b.scrollTop = wheelTo;
+  setTimeout(updateMore, 300);
+};
+// after the screen wakes, lay the answer out again (sizes measured while hidden can be off)
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { lastReply = null; render(); } });
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowDown") r1Key("down");
+  if (e.key === "ArrowUp") r1Key("up");
+});
+$("scroller").addEventListener("scroll", updateMore);
+</script>
+</body>
+</html>

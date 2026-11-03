@@ -1,0 +1,1284 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""Voice agent backend for the Claude R1 launcher (serves the UI on 127.0.0.1:8765).
+
+Tap → record (PulseAudio) → transcribe (ElevenLabs Scribe, whisper.cpp fallback) → one
+long-lived Claude Code session with the Android tools → speak (ElevenLabs, espeak fallback).
+New camera photos are sent into the same conversation as soon as they are saved.
+"""
+import array, base64, json, math, os, queue, re, shutil, signal, socket, struct, subprocess, sys, threading, time
+import urllib.error, urllib.request, uuid, wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOST, PORT = "127.0.0.1", 8765
+PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+HOME = os.path.expanduser("~")
+CONF = os.path.join(HOME, ".config/r1")
+UI_DIR = os.path.join(PREFIX, "share/r1/voice-ui")
+TMP = os.path.join(PREFIX, "tmp/r1")
+PHOTO_DIR = os.path.join(TMP, "photos")
+CAMERA_DIR = "/sdcard/DCIM/Camera"
+RAW = os.path.join(TMP, "voice.wav")
+RATE = 16000
+WHISPER = os.path.join(HOME, "whisper.cpp/build/bin/whisper-cli")
+WHISPER_MODEL = os.path.join(HOME, "whisper.cpp/models/ggml-base.en.bin")
+EL_API = "https://api.elevenlabs.io/v1"
+
+SYSTEM = """You are Claude, the voice assistant that is the whole interface of this Rabbit R1, a small \
+handheld Android device. The user holds the side button and talks to you, usually while out and about; \
+their words come from speech recognition and may contain errors, so read them for what they most likely \
+meant. Your reply is spoken aloud and shown in large type on a 480x640 screen.
+
+BE PROACTIVE AND HELPFUL
+- Act, don't ask. Pick the sensible default and do it: the user's home area for weather and places, today \
+for dates, the most likely match for a name, the latest episode of a show. Ask a short question only when a \
+wrong guess would be costly or the request is genuinely ambiguous.
+- Use your tools freely and chain them; do the research yourself rather than telling the user where to look.
+- Anticipate the one thing they will need next and include it: rain means an umbrella, a delayed flight \
+means the new time and gate, a long podcast means how long it runs.
+- When it is clearly useful, end with one short offer for the obvious next step ("Want me to play it?"). \
+Not on every turn.
+- Use what was said earlier in the conversation; don't make them repeat themselves.
+- If something fails, try another way before giving up. If you can't find live data, say so in one short \
+sentence and give what you do know; don't send them to other apps or websites.
+
+HOW TO SPEAK
+- At most 40 words, in plain conversational sentences: no markdown, lists, code blocks or emoji.
+- Give your single best answer; don't talk about sources disagreeing or where the data came from unless asked. \
+Never end with warnings, caveats or advice to check again or double-check; give the answer and stop. 
+- Never read error messages, URLs or IDs aloud.
+
+CARDS
+The screen can show cards: whenever you answer about weather, a flight, a stock or market index, a list of \
+things (results, steps, events, scores, emails, notifications), the device's battery or status, or one key \
+number or time, call show_card with that data before your final reply, even if the data is approximate. \
+Then speak one or two sentences that summarise it rather than reading every value.
+
+WHAT YOU CAN DO
+- The device: see and control it with the android tools (screenshot, ui_elements, tap, swipe, type_text, \
+press_key, open_app, notifications, device_status...). After doing something in another app, press home so \
+the user comes back to you, unless they asked to look at it; then tell them holding the side button brings \
+them back. If they ask to go back or go home, press home right away.
+- Photos: when the user asks you to take a picture or to look at something, call take_photo right away; \
+never tell them to press a button. When a message says they just took a photo, reply with one short \
+sentence about what it shows.
+- The web: search and read pages yourself (WebSearch, WebFetch) and answer here. Use open_url only when the \
+user wants to see a page (directions: https://www.google.com/maps/dir/?api=1&destination=PLACE).
+- Listening: podcasts (search_podcasts, podcast_episodes, play_audio), radio and music by station or genre \
+(search_radio, play_audio), playback (media_control: pause, resume, skip, volume; it also controls other music \
+apps). Playback pauses by itself while the user talks to you. After starting something, reply in a few words.
+- Bluetooth headphones and speakers: bluetooth (status, on, off, pair).
+- Email: read the user's Gmail (search_threads, get_thread) and write drafts (create_draft). You cannot send, \
+delete or archive mail: if asked to send, write the draft and say it's waiting in Drafts. For an inbox \
+overview, show a list card of senders and subjects.
+- Your voice: change it with list_voices and set_voice when asked.
+- Your body: the context note says how the R1 is being held and whether it's moving (device_motion gives \
+detail). Let it shape your answers: someone walking wants it shorter; lying face down on a table means they \
+put you down. vibrate gives a tap, a double nudge, a long buzz or an alert; use it sparingly, e.g. to confirm \
+something done or when the user asks.
+
+MEMORY AND CONTEXT
+- You have a memory that lasts across conversations. Whenever the user tells you something lasting about \
+themselves (their name, people in their life, where they live and work, routines, likes and dislikes, plans, \
+or anything they ask you to remember), save it with remember right away, without asking and without making a \
+fuss about it. If a fact changes, forget the old one and remember the new one. Use recall to refresh what you \
+know when it might help. Use what you know naturally, the way a friend would.
+- Each message starts with a note of the current date, time and the user's location. Use it for anything \
+time- or place-sensitive and never ask the user for the date, time or where they are.
+
+THE DEVICE
+- One side button: hold it to talk, double-press it for the camera.
+- Holding a finger on the screen opens a menu with Start over (which forgets this conversation), Apps and \
+Settings. When the user asks how to start over, reset, start a new conversation, or reach apps or settings, \
+tell them: hold a finger on the screen, then tap Start over twice (or Apps, or Settings). Don't mention the \
+menu otherwise.
+- If an android tool fails because phone controls are off, say that phone controls are off and can be turned \
+back on from the clock screen.
+
+LIMITS
+You are a voice assistant, not a coding agent: never look for, read or edit source code, and if the user asks \
+to change this app itself, say briefly that it has to be done from their computer."""
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def read_conf(name, default=None):
+    try:
+        return open(os.path.join(CONF, name)).read().strip()
+    except OSError:
+        return default
+
+
+VOICE_ID = read_conf("voice_id", "JBFqnCBsd6RMkjVDRZzb")
+HOME_AREA = read_conf("home_location")          # e.g. "Brooklyn, New York": the default place for weather etc.
+MEMORY_FILE = os.path.join(CONF, "memory.json")
+
+
+def system_prompt():
+    """SYSTEM plus the user's home area and remembered facts, read fresh whenever Claude starts."""
+    extra = f"\n\nThe user's home area is {HOME_AREA}." if HOME_AREA else ""
+    try:
+        facts = [f["fact"] for f in json.load(open(MEMORY_FILE))]
+    except (OSError, ValueError, KeyError, TypeError):
+        facts = []
+    if facts:
+        extra += "\n\nWHAT YOU KNOW ABOUT THE USER (from earlier conversations)\n" + "\n".join("- " + f for f in facts)
+    return SYSTEM + extra
+TTS_MODEL = read_conf("tts_model", "eleven_flash_v2_5")
+CLAUDE_MODEL = read_conf("claude_model", "claude-haiku-5-5")
+
+
+# ---------------------------------------------------------------- shared state + SSE
+
+REPLY_RULES = ("[Reply rules for this turn: if the answer is weather, a flight, a stock, a list, scores, "
+               "a time or one key number, call show_card first, even if you showed the same thing earlier. "
+               "No caveats or advice to double-check.]")
+
+
+def with_rules(content):
+    """Per-turn context note and reminder around text turns; photo turns (lists) pass through unchanged."""
+    return f"[{context_note()}]\n" + content + "\n\n" + REPLY_RULES if isinstance(content, str) else content
+
+
+SENSORS = {}     # the launcher's latest motion reading: posture, motion, gravity, movement, at
+
+
+def context_note():
+    note = f"Now: {time.strftime('%A, %B %-d, %Y, %-I:%M %p %Z')}; location: {LOCATION.describe()}"
+    if SENSORS and time.time() - SENSORS.get("at", 0) < 120:
+        note += f"; the R1 is {SENSORS['posture']}, {SENSORS['motion']}"
+    return note
+
+
+class Location:
+    """Where the R1 is: a recent GPS fix if Android has one, else the city of its internet connection
+    (ipinfo.io), else the configured home area. Refreshed in the background every 15 minutes."""
+
+    def __init__(self):
+        self.text, self.at = "", 0.0
+
+    def describe(self):
+        return self.text or (f"{HOME_AREA} (home area)" if HOME_AREA else "unknown")
+
+    def refresh(self):
+        gps = run(["timeout", "10", "rish", "-c", "dumpsys location | grep -m1 -o 'last location=Location\\[gps [-0-9.,]*'"]).stdout
+        m = re.search(r"gps (-?[0-9.]+),(-?[0-9.]+)", gps)
+        if m:
+            self.text = f"GPS {m.group(1)}, {m.group(2)}" + (f" (home area: {HOME_AREA})" if HOME_AREA else "")
+        else:
+            try:
+                req = urllib.request.Request("https://ipinfo.io/json", headers={"User-Agent": "claude-r1/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    ip = json.load(r)
+                self.text = f"around {ip.get('city')}, {ip.get('region')} (from the network)" + \
+                    (f"; home area: {HOME_AREA}" if HOME_AREA else "")
+            except (OSError, ValueError):
+                pass
+        self.at = time.time()
+
+
+LOCATION = Location()
+
+
+class Hub:
+    """Current UI state, pushed to every connected page as server-sent events."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        # `boot` changes on every restart, telling open pages to reload (and pick up new UI code)
+        self.state = {"state": "ready", "you": "", "reply": "", "tool": "", "photo": "", "error": "", "card": None,
+                      "notice": "", "media": None, "ptt": False, "auto": False, "warming": False, "retry": False, "controls": False, "online": True,
+                      "boot": uuid.uuid4().hex}
+        self.clients = []
+
+    def set(self, **kw):
+        if kw.get("notice"):
+            kw["notice_id"] = uuid.uuid4().hex[:8]      # the same words can come up twice in a row
+        with self.lock:
+            self.state.update(kw, now=time.time())
+            msg = ("state", json.dumps(self.state))
+            for q in self.clients:
+                q.put(msg)
+
+    def levels(self, lv):
+        for q in list(self.clients):
+            q.put(("level", json.dumps(lv)))
+
+    def subscribe(self):
+        q = queue.Queue()
+        with self.lock:
+            self.clients.append(q)
+            q.put(("state", json.dumps(self.state)))
+        return q
+
+    def unsubscribe(self, q):
+        with self.lock:
+            if q in self.clients:
+                self.clients.remove(q)
+
+
+HUB = Hub()
+
+
+# ---------------------------------------------------------------- audio
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw)
+
+
+def ensure_services():
+    if subprocess.run(["pulseaudio", "--check"]).returncode:
+        run(["pulseaudio", "--start", "--load=module-sles-source", "--exit-idle-time=-1"])
+    if run(["pgrep", "-f", "bin/android-mcp$"]).returncode:
+        subprocess.Popen(["android-mcp"], stdout=subprocess.DEVNULL,
+                         stderr=open(os.path.join(TMP, "android-mcp.log"), "a"), start_new_session=True)
+
+
+class Recorder:
+    def __init__(self):
+        self.proc, self.thread, self.pcm, self.levels = None, None, bytearray(), []
+
+    def recording(self):
+        return self.proc is not None
+
+    def spoke(self):
+        """Whether anything louder than room noise (about -40 dB) was recorded."""
+        return sum(1 for v in self.levels if v > 0.45) >= 4
+
+    def start(self):
+        self.pcm, self.levels = bytearray(), []
+        self.proc = subprocess.Popen(["parec", f"--rate={RATE}", "--channels=1", "--format=s16le",
+                                      "--latency-msec=40"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.thread = threading.Thread(target=self._pump, daemon=True)
+        self.thread.start()
+
+    def _pump(self):
+        step, pending, batch = RATE // 20 * 2, b"", []      # one level per 50ms of audio
+        for chunk in iter(lambda: self.proc.stdout.read1(4096), b""):
+            self.pcm += chunk
+            pending += chunk
+            while len(pending) >= step:
+                s = array.array("h", pending[:step])
+                pending = pending[step:]
+                rms = math.sqrt(sum(x * x for x in s) / len(s)) / 32768
+                db = 20 * math.log10(rms) if rms > 0 else -90
+                batch.append(round(min(1.0, max(0.0, (db + 60) / 45)), 3))   # -60..-15 dB → 0..1
+                self.levels.append(batch[-1])
+                if len(batch) >= 2:
+                    HUB.levels(batch)
+                    batch = []
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait()
+            self.thread.join(2)
+            self.proc = None
+        with wave.open(RAW, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(bytes(self.pcm))
+        return len(self.pcm) / (RATE * 2)
+
+
+def el_key():
+    return read_conf("elevenlabs_key")
+
+
+class Offline(Exception):
+    pass
+
+
+def online():
+    try:
+        socket.getaddrinfo("api.anthropic.com", 443)
+        return True
+    except OSError:
+        return False
+
+
+OFFLINE_NOTICE = "No internet connection."   # short enough for the status pill
+
+
+def still_offline():
+    """The UI says offline: re-check for up to 1.5s before refusing (never call with Agent.lock held)."""
+    if HUB.state.get("online") is not False:
+        return False
+    result = []
+    t = threading.Thread(target=lambda: result.append(online()), daemon=True)
+    t.start()
+    t.join(1.5)
+    if result and result[0]:
+        HUB.set(online=True)
+        return False
+    return True
+
+
+def watch_network():
+    """Keep `online` in the UI state, so the status row can say Offline before anyone asks; refresh where we are."""
+    while True:
+        if time.time() - LOCATION.at > 900:
+            threading.Thread(target=LOCATION.refresh, daemon=True).start()
+        up = online()
+        if HUB.state.get("online") != up:
+            HUB.set(online=up)
+        time.sleep(10)
+
+
+def transcribe(path):
+    if not online():
+        raise Offline()
+    key = el_key()
+    if key:
+        try:
+            boundary = uuid.uuid4().hex
+            parts = []
+            for name, value in (("model_id", "scribe_v2"), ("language_code", "en"), ("tag_audio_events", "false")):
+                parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
+                         f'Content-Type: audio/wav\r\n\r\n'.encode() + open(path, "rb").read() + b"\r\n")
+            parts.append(f"--{boundary}--\r\n".encode())
+            req = urllib.request.Request(f"{EL_API}/speech-to-text", data=b"".join(parts), method="POST", headers={
+                "xi-api-key": key, "Content-Type": f"multipart/form-data; boundary={boundary}"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r).get("text", "").strip()
+        except Exception as e:
+            log("scribe failed, using whisper:", e)
+    if not os.path.exists(WHISPER):
+        log("no ElevenLabs key and no whisper.cpp: can't transcribe")
+        return ""
+    wav = os.path.join(TMP, "voice-norm.wav")
+    run(["sox", path, wav, "highpass", "100", "gain", "-n", "-3"])
+    r = run([WHISPER, "-m", WHISPER_MODEL, "-f", wav, "-t", "6", "-nt", "-np"])
+    return re.sub(r"\[[^\]]*\]|\([^)]*\)", "", " ".join(r.stdout.split())).strip()
+
+
+class Speaker:
+    """ElevenLabs streamed PCM into paplay, so speech starts ~0.3s after the request."""
+
+    def __init__(self):
+        self.lock, self.player, self.resp = threading.Lock(), None, None
+        self.gen, self.pending = 0, False       # gen invalidates a say() that has not started playing yet
+
+    def speaking(self):
+        return self.pending or (self.player is not None and self.player.poll() is None)
+
+    def _kill(self):
+        """Stop the player and close the response (lock held)."""
+        if self.player and self.player.poll() is None:
+            try:
+                os.killpg(self.player.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                self.player.kill()
+        if self.resp:
+            try:
+                self.resp.close()
+            except Exception:
+                pass
+        self.player, self.resp = None, None
+
+    def claim(self):
+        """Take over the speaker before a reply is published as "speaking"; returns the token for say()."""
+        with self.lock:
+            self._kill()
+            self.gen += 1
+            self.pending = True
+            return self.gen
+
+    def say(self, text, token=None):
+        if token is None:
+            token = self.claim()
+        try:
+            text = re.sub(r"[*_`#>|]", "", text).strip()
+            if not text:
+                return
+            resp = None
+            try:
+                key = el_key()
+                if not key:
+                    raise RuntimeError("no ElevenLabs key")
+                req = urllib.request.Request(
+                    f"{EL_API}/text-to-speech/{read_conf('voice_id', VOICE_ID)}/stream?output_format=pcm_16000", method="POST",
+                    data=json.dumps({"text": text, "model_id": TTS_MODEL}).encode(),
+                    headers={"xi-api-key": key, "Content-Type": "application/json"})
+                resp = urllib.request.urlopen(req, timeout=20)
+            except Exception as e:
+                log("elevenlabs failed, using espeak:", e)
+            if resp is None:
+                with self.lock:
+                    if token != self.gen:
+                        return
+                    self.player = subprocess.Popen(["bash", "-c", 'espeak -s 165 --stdout "$1" | paplay', "_", text],
+                                                   start_new_session=True, stderr=subprocess.DEVNULL)
+                    player = self.player
+                player.wait()
+                return
+            try:
+                with self.lock:
+                    if token != self.gen:
+                        resp.close()
+                        return
+                    self.resp = resp
+                    self.player = subprocess.Popen(["paplay", "--raw", f"--rate={RATE}", "--channels=1",
+                                                    "--format=s16le"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    player = self.player
+                for chunk in iter(lambda: resp.read(4096), b""):
+                    if player.poll() is not None:
+                        break
+                    player.stdin.write(chunk)
+                try:
+                    player.stdin.close()
+                except OSError:
+                    pass
+                player.wait()
+            except (BrokenPipeError, ValueError, OSError):
+                pass                                # stopped mid-sentence
+        finally:
+            with self.lock:
+                if token == self.gen:
+                    self.pending = False
+
+    def stop(self):
+        with self.lock:
+            self.gen += 1
+            self.pending = False
+            self._kill()
+
+
+# ---------------------------------------------------------------- media player
+
+class Player:
+    """Podcasts, radio and music through mpv, controlled over its IPC socket. It pauses itself while
+    the user talks to Claude ("ducked") and resumes once the answer has been spoken. A play request
+    that arrives during a turn waits for the answer, so the music doesn't start over Claude's voice."""
+    SOCK = os.path.join(TMP, "mpv.sock")
+
+    def __init__(self):
+        self.proc, self.title, self.kind = None, "", ""
+        self.ducked, self.pending, self.lock = False, None, threading.Lock()
+
+    def active(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _ipc(self, *command):
+        try:
+            with socket.socket(socket.AF_UNIX) as c:
+                c.settimeout(2)
+                c.connect(self.SOCK)
+                c.sendall(json.dumps({"command": list(command)}).encode() + b"\n")
+                return json.loads(c.makefile().readline() or "{}")
+        except (OSError, ValueError):
+            return {}
+
+    def _publish(self):
+        playing = self.active() and not self._ipc("get_property", "pause").get("data", False)
+        HUB.set(media={"title": self.title, "kind": self.kind, "playing": playing} if self.active() else None)
+
+    def play(self, url, title, kind, busy):
+        with self.lock:
+            if busy:                          # mid-turn: start once the answer has been spoken
+                self.pending = (url, title, kind)
+                return "Queued; it starts when you finish answering."
+            self._start(url, title, kind)
+        return f"Playing {title or url}."
+
+    def _start(self, url, title, kind):
+        self._kill()
+        self.title, self.kind, self.ducked, self.pending = title, kind, False, None
+        self.proc = subprocess.Popen(["mpv", "--no-video", "--ao=pulse", "--really-quiet", "--volume=70",
+                                      f"--input-ipc-server={self.SOCK}", url],
+                                     stdout=subprocess.DEVNULL, stderr=open(os.path.join(TMP, "mpv.log"), "a"),
+                                     start_new_session=True)
+        threading.Thread(target=self._watch, args=(self.proc,), daemon=True).start()
+        time.sleep(0.5)
+        self._publish()
+
+    def _watch(self, proc):
+        proc.wait()
+        if proc is self.proc:                 # finished or failed by itself
+            self.proc = None
+            HUB.set(media=None)
+
+    def _kill(self):
+        if self.active():
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self.proc = None
+
+    def duck(self):
+        with self.lock:
+            if self.active() and not self._ipc("get_property", "pause").get("data", True):
+                self._ipc("set_property", "pause", True)
+                self.ducked = True
+
+    def unduck(self):
+        with self.lock:
+            if self.pending:
+                self._start(*self.pending)
+                return
+            if self.ducked and self.active():
+                self._ipc("set_property", "pause", False)
+            self.ducked = False
+        self._publish()
+
+    def control(self, action, value=None):
+        with self.lock:
+            if not self.active() and action != "status":
+                return False, "Nothing is playing here."
+            if action == "pause":
+                self._ipc("set_property", "pause", True)
+                self.ducked = False           # the user paused it: don't resume after the answer
+            elif action == "resume":
+                self._ipc("set_property", "pause", False)
+                self.ducked = False
+            elif action == "stop":
+                self._kill()
+                self.ducked = self.pending = False
+                HUB.set(media=None)
+                return True, "Stopped."
+            elif action in ("skip_forward", "skip_back"):
+                secs = int(value or 30) * (1 if action == "skip_forward" else -1)
+                self._ipc("seek", secs, "relative")
+            elif action == "volume":
+                self._ipc("set_property", "volume", max(0, min(100, int(value if value is not None else 70))))
+            elif action == "status":
+                if not self.active():
+                    return True, "Nothing is playing."
+                pos = self._ipc("get_property", "time-pos").get("data") or 0
+                return True, f"{'Paused' if self._ipc('get_property', 'pause').get('data') else 'Playing'}: " \
+                             f"{self.title} ({self.kind}), {int(pos) // 60} min in."
+            else:
+                return False, f"Can't {action} here."
+        self._publish()
+        return True, "Done."
+
+
+PLAYER = Player()
+
+
+# ---------------------------------------------------------------- claude
+
+TOOL_LABELS = {"screenshot": "Looking at the screen", "ui_elements": "Reading the screen",
+               "tap": "Tapping", "swipe": "Swiping", "type_text": "Typing", "press_key": "Pressing a key",
+               "open_app": "Opening {app}", "list_apps": "Checking apps", "device_status": "Checking the device",
+               "notifications": "Reading notifications", "recent_photos": "Looking at photos",
+               "android_shell": "Running a command", "WebSearch": "Searching the web", "WebFetch": "Reading a page",
+               "ToolSearch": "Getting my tools ready", "show_card": "Making a card", "take_photo": "Taking a photo", "list_voices": "Looking at voices", "remember": "Remembering that", "vibrate": "Buzzing", "device_motion": "Feeling how I'm held", "recall": "Thinking about you",
+               "forget": "Forgetting that", "bluetooth": "Checking Bluetooth",
+               "search_podcasts": "Finding podcasts", "podcast_episodes": "Getting episodes",
+               "search_radio": "Finding stations", "play_audio": "Starting playback", "media_control": "Adjusting playback",
+               "search_threads": "Checking your email", "get_thread": "Reading an email", "get_message": "Reading an email",
+               "create_draft": "Drafting an email", "set_voice": "Changing my voice",
+               "open_url": "Opening the page"}
+
+
+# Gmail comes from the claude.ai connector of the account Claude Code is logged into: reading and drafts
+# only (no send/delete). Other claude.ai connectors stay out of the voice session to keep it fast.
+GMAIL_TOOLS = ",".join("mcp__claude_ai_Gmail__" + t for t in
+                       ("search_threads", "get_thread", "get_message", "list_labels", "list_drafts", "get_draft",
+                        "create_draft"))
+OTHER_CONNECTORS = ",".join(("mcp__claude_ai_Google_Drive", "mcp__claude_ai_Google_Calendar", "mcp__claude_ai_Claude_Docs"))
+
+
+class Claude:
+    """One long-lived `claude -p` over stream-json: start-up under proot costs ~12s on the R1."""
+
+    def __init__(self):
+        self.proc, self.lock, self.warm = None, threading.Lock(), False
+
+    def cold(self):
+        """True until the current process has answered once (start-up under proot is ~12s)."""
+        return not (self.warm and self.proc and self.proc.poll() is None)
+
+    def start(self, fresh=False):
+        if self.proc and self.proc.poll() is None:
+            return
+        self.warm = False
+        cont = "" if fresh else "--continue "
+        script = ("mkdir -p /root/voice && cd /root/voice && exec claude -p " + cont +
+                  "--verbose --input-format stream-json --output-format stream-json "
+                  "--model " + CLAUDE_MODEL + " --allowedTools=mcp__android,WebSearch,WebFetch," + GMAIL_TOOLS +
+                  " --disallowedTools=" + OTHER_CONNECTORS + " --append-system-prompt \"$1\"")
+        self.proc = subprocess.Popen(
+            ["proot-distro", "login", "debian", "--shared-tmp", "--",
+             "env", "PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin",
+             "DISABLE_AUTOUPDATER=1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+             # load every tool's schema up front: there are few, and Haiku won't go looking for
+             # deferred ones (show_card went unused); the claude.ai connectors aren't approved here
+             "ENABLE_TOOL_SEARCH=false",
+             "bash", "-c", script, "_", system_prompt()],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "claude.log"), "a"),
+            text=True, bufsize=1, start_new_session=True)
+
+    def restart(self, fresh=False):
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self.proc = None
+        self.start(fresh)
+
+    def interrupt(self):
+        """Ask Claude Code to stop the current turn (it still emits a result we then ignore)."""
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.write(json.dumps({"type": "control_request", "request_id": uuid.uuid4().hex,
+                                                  "request": {"subtype": "interrupt"}}) + "\n")
+                self.proc.stdin.flush()
+            except OSError:
+                pass
+
+    def ask(self, content, on_tool=None):
+        with self.lock:
+            self.start()
+            try:
+                self.proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n")
+                self.proc.stdin.flush()
+                for line in self.proc.stdout:
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") == "assistant" and on_tool:
+                        for block in ev.get("message", {}).get("content", []):
+                            if block.get("type") == "tool_use":
+                                name = block.get("name", "").split("__")[-1]
+                                label = TOOL_LABELS.get(name, "Working")
+                                on_tool(label.format(**{k: str(v).split(".")[-1] for k, v in
+                                                        (block.get("input") or {}).items()}) + "…")
+                    if ev.get("type") == "result":
+                        self.warm = True
+                        return plain(ev.get("result") or "").strip() or "Done."
+            except (BrokenPipeError, OSError) as e:
+                log("claude pipe:", e)
+            self.proc = None
+            return "Claude stopped unexpectedly. Ask again to restart it."
+
+
+def plain(text):
+    text = re.sub(r"\*\*|__|`+|^#+\s*", "", text, flags=re.M)
+    return re.sub(r"^\s*[-*]\s+", "• ", text, flags=re.M)
+
+
+# ---------------------------------------------------------------- the agent
+
+GO_BACK = re.compile(r"^\W*(please\W+)?(take me |go |bring me |get me )?(back|home)( home)?( to (claude|you|the (voice|home) screen))?"
+                     r"( please)?\W*$", re.I)
+# questions about the app itself get a fixed answer: no need to ask Claude (whose history may disagree)
+HOW_START_OVER = re.compile(r"\b(how (do|can) i|how to|can i|can you|i want to|let'?s)\b.*\b(start over|start fresh|"
+                            r"start again|reset( (you|this|our|the) (conversation|chat))?|clear (this|our|the) "
+                            r"(conversation|chat)|(a )?new (conversation|chat)|forget (this|our|the) conversation|"
+                            r"forget everything)\W*$", re.I)
+START_OVER_HELP = "Hold a finger on the screen, then tap Start over twice. That starts a fresh conversation."
+VIEW_KEYS = ("state", "you", "reply", "photo", "card", "error")
+TURN_TIMEOUT_S = 45
+
+
+class Agent:
+    """The conversation loop. `turn` identifies the Claude request whose result may be shown;
+    `rec_id` the recording. A hold or tap only interrupts Claude once real speech was recorded,
+    so holding the button just to come back to Claude never loses what was on screen."""
+
+    def __init__(self):
+        self.rec, self.speaker, self.claude = Recorder(), Speaker(), Claude()
+        self.lock = threading.Lock()
+        self.turn = 0           # bumped whenever a Claude result should no longer be shown
+        self.rec_id = 0         # bumped per recording
+        self.ptt = None         # None | "pending" (button down) | "held" | "auto" (stops on silence)
+        self.saved = None       # the view to put back if a recording turns out silent
+        self.parked = None      # a reply that arrived while the user was holding to talk
+        self.before = None      # the view before the current question, for cancel
+        self.last_content = None
+
+    # ---- listening
+
+    def _listen(self, ptt):
+        PLAYER.duck()
+        if HUB.state["state"] != "listening":
+            self.saved = {k: HUB.state[k] for k in VIEW_KEYS}
+        if self.speaker.speaking():
+            self.speaker.stop()
+            if self.saved and self.saved["state"] == "speaking":
+                self.saved["state"] = "answer"
+        if not self.rec.recording():
+            self.rec.start()
+        self.rec_id += 1
+        self.ptt = ptt
+        HUB.set(state="listening", since=time.time(), notice="", ptt=bool(ptt), auto=ptt == "auto")
+        return self.rec_id
+
+    # push-to-talk on the side (power) button. Pressing starts the mic quietly so the first
+    # syllable isn't lost; holding past HOLD_S makes it a talk; releasing sends it. A short
+    # press (screen off, or the camera double-press) just throws the audio away.
+    def ptt_press(self):
+        with self.lock:
+            if HUB.state["state"] == "listening" or self.rec.recording():
+                return
+            self.rec.start()
+            self.ptt = "pending"
+
+    def ptt_hold(self, autostop=False):
+        with self.lock:
+            log("ptt hold: autostop", autostop, "state", HUB.state["state"], "ptt", self.ptt)
+            if HUB.state["state"] == "listening":
+                return
+            gated = HUB.state["state"] in ("ready", "answer")
+        if gated and still_offline():           # ptt stays "pending": the release throws the audio away
+            HUB.set(notice=OFFLINE_NOTICE)
+            threading.Thread(target=self.speaker.say, args=("No internet connection.",), daemon=True).start()
+            return
+        with self.lock:
+            if HUB.state["state"] == "listening" or (gated and HUB.state["state"] not in ("ready", "answer")):
+                return
+            rid = self._listen("auto" if autostop else "held")
+        if autostop:
+            threading.Thread(target=self._stop_on_silence, args=(rid,), daemon=True).start()
+
+    def ptt_release(self):
+        with self.lock:
+            mode, self.ptt = self.ptt, None
+            log("ptt release: mode", mode, "state", HUB.state["state"], "recording", self.rec.recording())
+            if mode == "pending" and HUB.state["state"] != "listening":
+                self.rec.stop()
+                return
+            if mode == "held" and HUB.state["state"] == "listening":
+                threading.Thread(target=self._finish_recording, daemon=True).start()
+
+    def assist(self):
+        """The launcher was opened by a long press (Android's assistant action)."""
+        log("assist: watcher alive", BUTTON.alive, "down", BUTTON.down)
+        if not BUTTON.alive:
+            self.ptt_hold(autostop=True)        # no release event coming: stop on silence
+        elif BUTTON.down:
+            self.ptt_hold()                     # the watcher's own hold timer usually got here first
+
+    def _stop_on_silence(self, rid):
+        """Without the button watcher there's no release event: stop after ~1.2s of quiet once
+        speech began, or after 4s if nothing is said (then it was just a "take me back")."""
+        start = time.time()
+        while rid == self.rec_id and HUB.state["state"] == "listening" and time.time() - start < 30:
+            time.sleep(0.2)
+            lv = self.rec.levels
+            if self.rec.spoke() and len(lv) > 24 and max(lv[-24:]) < 0.3:
+                break
+            if not self.rec.spoke() and time.time() - start > 4:
+                break
+        if rid == self.rec_id and HUB.state["state"] == "listening":
+            self.talk()
+
+    def talk(self):
+        """A tap: start listening, or send what was recorded."""
+        for checked in (False, True):
+            with self.lock:
+                st = HUB.state["state"]
+                log("talk (tap): state", st, "ptt", self.ptt)
+                if st == "listening":
+                    self.ptt = None
+                    threading.Thread(target=self._finish_recording, daemon=True).start()
+                    return
+                if st in ("transcribing", "thinking"):
+                    return
+                if checked or st not in ("ready", "answer"):
+                    rid = self._listen(None)
+                    break
+            if still_offline():                 # outside the lock: the DNS lookup can block
+                HUB.set(notice=OFFLINE_NOTICE)
+                return
+        threading.Thread(target=self._tap_limit, args=(rid,), daemon=True).start()
+
+    def _tap_limit(self, rid):
+        """A forgotten tap-to-talk (or a pocket tap) stops by itself."""
+        time.sleep(60)
+        if rid == self.rec_id and HUB.state["state"] == "listening":
+            self.talk()
+
+    def _finish_recording(self):
+        with self.lock:
+            if HUB.state["state"] != "listening":
+                return log("finish: not listening any more")
+            self.rec_id += 1
+            secs = self.rec.stop()
+            spoke = self.rec.spoke()
+            log(f"finish: {secs:.1f}s, speech {spoke}")
+            if secs < 1.0 or not spoke:
+                return self._restore()
+            # real speech: now the new question replaces whatever Claude was doing
+            if self.saved["state"] in ("answer", "ready", "speaking"):
+                self.before = dict(self.saved, state="answer")
+            self.turn += 1
+            turn = self.turn
+            busy = self.saved and self.saved["state"] in ("transcribing", "thinking")
+            if busy:
+                self.claude.interrupt()
+            self.parked, self.saved = None, None if not busy else self.saved
+            HUB.set(state="transcribing", you="", tool="", ptt=False)
+        try:
+            text = transcribe(RAW)
+        except Offline:
+            if turn == self.turn:
+                HUB.set(online=False)
+                with self.lock:
+                    self.saved = self.saved or self.before
+                    self._restore(notice=OFFLINE_NOTICE)
+            return
+        if turn != self.turn:
+            return
+        if HOW_START_OVER.search(text):
+            return self._local_reply(turn, text, START_OVER_HELP)
+        if GO_BACK.match(text):                  # holding the button already brought Claude to the front
+            with self.lock:
+                self.saved = self.saved or self.before
+                self._restore()
+            return
+        if not text:
+            with self.lock:
+                self.saved = self.saved or self.before
+                self._restore(notice="Didn't catch that. Try again.")
+            return
+        self._respond(turn, text, text, photo="")
+
+    def _restore(self, notice=""):
+        """Put back the screen from before the recording (lock held)."""
+        saved, self.saved = self.saved or {"state": "ready"}, None
+        if saved["state"] not in ("transcribing", "thinking"):
+            threading.Thread(target=PLAYER.unduck, daemon=True).start()
+        if self.parked:                              # Claude finished while we were listening
+            reply, self.parked = self.parked, None
+            tok = self.speaker.claim()
+            HUB.set(state="speaking", reply=reply, tool="", notice=notice, ptt=False)
+            threading.Thread(target=self._speak, args=(self.turn, reply, tok), daemon=True).start()
+            return
+        if saved["state"] in ("transcribing", "thinking"):
+            HUB.set(**saved, notice=notice, ptt=False)       # still working on it
+            return
+        state = "answer" if saved.get("reply") or saved.get("photo") or saved.get("error") else "ready"
+        HUB.set(**dict(saved, state=state), notice=notice, ptt=False)
+
+    # ---- answering
+
+    def _respond(self, turn, shown, content, photo):
+        self.before = {k: HUB.state[k] for k in VIEW_KEYS} if HUB.state["state"] in ("answer", "ready", "speaking") \
+            else self.before
+        self.last_content = (shown, content, photo)
+        HUB.set(state="thinking", you=shown, reply="", photo=photo, tool="", card=None, error="",
+                notice="", since=time.time(), warming=self.claude.cold())
+        watchdog = threading.Timer(TURN_TIMEOUT_S, self._timeout, args=(turn,))
+        watchdog.start()
+        try:
+            reply = self.claude.ask(with_rules(content), on_tool=lambda t: turn == self.turn and HUB.set(tool=t, warming=False))
+        finally:
+            watchdog.cancel()
+        with self.lock:
+            if turn != self.turn:
+                return
+            if HUB.state["state"] == "listening":     # he's holding to talk: show it if he stays silent
+                self.parked = reply
+                return
+            tok = self.speaker.claim()
+            HUB.set(state="speaking", reply=reply, tool="", warming=False)
+        self._speak(turn, reply, tok)
+
+    def _local_reply(self, turn, shown, reply):
+        """Answer without Claude (fixed help text)."""
+        with self.lock:
+            if turn != self.turn:
+                return
+            token = self.speaker.claim()
+            HUB.set(state="speaking", you=shown, reply=reply, photo="", card=None, error="", tool="")
+        self._speak(turn, reply, token)
+
+    def _speak(self, turn, reply, token):
+        self.speaker.say(reply, token)
+        if turn == self.turn and HUB.state["state"] == "speaking":
+            HUB.set(state="answer")
+            PLAYER.unduck()
+
+    def _timeout(self, turn):
+        """No answer in TURN_TIMEOUT_S: probably no connection. Stop waiting and offer a retry."""
+        if turn != self.turn:
+            return
+        log("turn timed out")
+        with self.lock:
+            self.turn += 1
+            HUB.set(state="answer", reply="", tool="", warming=False, retry=True,
+                    error="No answer — the connection may be down. Tap to try again.")
+        self.claude.interrupt()
+        time.sleep(5)
+        if self.claude.lock.locked():               # the interrupt didn't free it: start over
+            self.claude.restart()
+
+    def retry(self):
+        if not self.last_content or HUB.state["state"] in ("listening", "transcribing", "thinking"):
+            return
+        if still_offline():
+            HUB.set(notice=OFFLINE_NOTICE)
+            return
+        with self.lock:
+            self.turn += 1
+            turn = self.turn
+        HUB.set(retry=False)
+        self._respond(turn, *self.last_content)
+
+    def stop_speaking(self):
+        self.speaker.stop()
+        HUB.set(state="answer")
+
+    def cancel(self):
+        with self.lock:
+            self.turn += 1
+            self.claude.interrupt()
+            self.speaker.stop()
+            prev = self.before or {}
+            has = prev.get("reply") or prev.get("photo")
+            HUB.set(**{k: prev.get(k, "" if k != "card" else None) for k in VIEW_KEYS if k != "state"},
+                    state="answer" if has else "ready", tool="", warming=False)
+
+    def new_conversation(self):
+        self.cancel()
+        self.claude.restart(fresh=True)
+        self.before = self.last_content = None
+        HUB.set(state="ready", you="", reply="", photo="", error="", card=None, retry=False, fresh=time.time())
+
+    def photo_taken(self, src):
+        """Shrink a new camera photo and hand it to Claude in the running conversation."""
+        name = os.path.splitext(os.path.basename(src))[0] + ".jpg"
+        thumb, full = os.path.join(PHOTO_DIR, "t_" + name), os.path.join(PHOTO_DIR, name)
+        for dst, side, qv in ((thumb, 480, 5), (full, 1280, 4)):
+            run(["ffmpeg", "-loglevel", "error", "-y", "-i", src, "-vf",
+                 f"scale='min({side},iw)':'min({side},ih)':force_original_aspect_ratio=decrease", "-q:v", str(qv), dst])
+        if not os.path.exists(full):
+            return log("could not convert", src)
+        with self.lock:
+            if HUB.state["state"] in ("listening", "transcribing"):
+                return log("photo arrived mid-question; Claude can still get it with recent_photos")
+            self.turn += 1
+            turn = self.turn
+            self.speaker.stop()
+        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                "data": base64.b64encode(open(full, "rb").read()).decode()}},
+                   {"type": "text", "text": f"I just took this photo with the R1 camera (saved on the device "
+                                            f"as {src}). In one short spoken sentence of at most 20 words, "
+                                            f"tell me what it shows. No lists."}]
+        self._respond(turn, "", content, photo="/photos/t_" + name)
+
+
+AGENT = None
+
+
+class Button:
+    """Watch the side (power) button by reading its input devices raw, which needs the shell user
+    (Shizuku's rish). rish's own stdout relay is slow and batches small writes, so the shell-side
+    reader sends the events straight to us over a local socket instead:
+    (echo TOKEN; cat /dev/input/eventN) | nc 127.0.0.1 8767.
+    Android still handles the key itself: its long-press action is "assistant", which opens the
+    launcher; this adds the press/release timing for push-to-talk."""
+    HOLD_S = 0.4
+    PORT = 8767
+    DEVICES = ("/dev/input/event0", "/dev/input/event1")    # the R1's mtk-kpd and mtk-pmic-keys, if discovery fails
+    EVENT = struct.Struct("<qqHHi")                          # struct input_event on arm64
+    EV_KEY, KEY_POWER = 1, 116
+
+    def __init__(self):
+        self._alive = self.down = False
+        self.timer, self.retry_now = None, False
+        self.lock = threading.Lock()
+        self.token = uuid.uuid4().hex
+        self.connected = 0
+
+    @property
+    def alive(self):
+        return self._alive
+
+    @alive.setter
+    def alive(self, v):
+        # the same Shizuku shell powers Claude's phone controls, so show it as "Phone controls"
+        if v != self._alive:
+            self._alive = v
+            HUB.set(controls=v)
+
+    def run(self):
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", self.PORT))
+        srv.listen(4)
+        threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
+        self._kill_readers()                 # a killed predecessor leaves its readers behind
+        while True:
+            procs = [subprocess.Popen(["rish", "-c", f"(echo {self.token}; exec cat {dev}) | nc 127.0.0.1 {self.PORT}"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                     for dev in self._devices()]
+            for p in procs:
+                p.wait()                     # returns when Shizuku (or the reader) goes away
+            self._kill_readers()
+            self.alive = False
+            for _ in range(20):              # Shizuku not running (it stops on reboot); try again
+                if self.retry_now:
+                    break
+                time.sleep(1)
+            self.retry_now = False
+
+    def _devices(self):
+        """Input devices that report the power key (numbering differs between Android builds)."""
+        # via a file: rish's own stdout relay reorders long output
+        tmp = "/sdcard/Download/.claude-r1-input-devices.txt"
+        run(["timeout", "15", "rish", "-c", f"getevent -lp > {tmp}"])
+        try:
+            with open(tmp) as f:
+                out = f.read()
+            os.remove(tmp)
+        except OSError:
+            out = ""
+        found = [blk.split("\n", 1)[0].split()[-1] for blk in out.split("add device")[1:] if "KEY_POWER" in blk]
+        return found or list(self.DEVICES)
+
+    def _kill_readers(self):
+        for pid in run(["pgrep", "-f", "rish -c (exec getevent|exec cat /dev/input|\\(echo)"]).stdout.split():
+            try:
+                os.killpg(int(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+
+    def reconnect(self):
+        """Drop the current readers so run() starts fresh ones right away."""
+        self.retry_now = True
+        self._kill_readers()
+
+    def _accept(self, srv):
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=self._read, args=(conn,), daemon=True).start()
+
+    def _read(self, conn):
+        f = conn.makefile("rb", buffering=0)
+        if f.readline().strip().decode(errors="replace") != self.token:
+            return conn.close()              # not our reader
+        with self.lock:
+            self.connected += 1
+        self.alive = True
+        size = self.EVENT.size
+        try:
+            while True:
+                data = f.read(size)
+                while data and len(data) < size:
+                    more = f.read(size - len(data))
+                    if not more:
+                        break
+                    data += more
+                if len(data) < size:
+                    return
+                _, _, typ, code, value = self.EVENT.unpack(data)
+                if typ == self.EV_KEY and code == self.KEY_POWER and value in (0, 1):
+                    self._key(value == 1)
+        finally:
+            conn.close()
+            with self.lock:
+                self.connected -= 1
+                if not self.connected:
+                    self.alive = False
+
+    def _key(self, pressed):
+        with self.lock:                      # both devices may report the same press
+            if pressed == self.down:
+                return
+            self.down = pressed
+        log("side button", "down" if pressed else "up")
+        if pressed:
+            AGENT.ptt_press()
+            self.timer = threading.Timer(self.HOLD_S, AGENT.ptt_hold)
+            self.timer.start()
+        else:
+            self.timer and self.timer.cancel()
+            AGENT.ptt_release()
+
+
+BUTTON = Button()
+
+
+last_photo = [0.0]
+
+
+def bring_claude_forward(when):
+    """After a photo, show Claude (with the photo and its caption) unless another shot followed."""
+    if last_photo[0] != when or not BUTTON.alive:
+        return
+    subprocess.Popen(["rish", "-c", "am start -n ai.r1.claude/.MainActivity"], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def watch_camera():
+    """Poll the camera folder; a file counts as new once its size has stopped changing."""
+    seen = set(os.listdir(CAMERA_DIR)) if os.path.isdir(CAMERA_DIR) else set()
+    while True:
+        time.sleep(1)
+        try:
+            names = set(os.listdir(CAMERA_DIR))
+        except OSError:
+            continue
+        for n in sorted(names - seen):
+            if not re.search(r"\.(jpe?g|png)$", n, re.I) or n.startswith("."):
+                seen.add(n)
+                continue
+            p = os.path.join(CAMERA_DIR, n)
+            size = -1
+            for _ in range(20):
+                s = os.path.getsize(p)
+                if s == size and s > 0:
+                    break
+                size = s
+                time.sleep(0.3)
+            seen.add(n)
+            log("new photo", n)
+            last_photo[0] = time.time()
+            threading.Thread(target=AGENT.photo_taken, args=(p,), daemon=True).start()
+            threading.Timer(3, bring_claude_forward, args=(last_photo[0],)).start()
+
+
+# ---------------------------------------------------------------- http
+
+MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
+        ".woff2": "font/woff2", ".jpg": "image/jpeg", ".png": "image/png", ".svg": "image/svg+xml"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _file(self, path):
+        try:
+            data = open(path, "rb").read()
+        except OSError:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("Content-Type", MIME.get(os.path.splitext(path)[1], "application/octet-stream"))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/api/events":
+            return self._events()
+        if path == "/api/sensors":
+            data = json.dumps(SENSORS).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+        if path.startswith("/photos/"):
+            return self._file(os.path.join(PHOTO_DIR, os.path.basename(path)))
+        rel = "index.html" if path == "/" else os.path.normpath(path.lstrip("/"))
+        if rel.startswith(".."):
+            return self.send_error(403)
+        self._file(os.path.join(UI_DIR, rel))
+
+    def do_POST(self):
+        if self.path == "/api/fix":
+            ok = run(["timeout", "10", "rish", "-c", "id"]).returncode == 0
+            if ok:
+                BUTTON.reconnect()
+                run(["pkill", "-f", "bin/android-mcp$"])        # its shell reconnects on restart
+                ensure_services()
+            data = json.dumps({"ok": ok}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+        if self.path == "/api/media":
+            try:
+                cmd = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            except ValueError:
+                return self.send_error(400)
+            if cmd.get("action") == "play":
+                busy = HUB.state["state"] in ("listening", "transcribing", "thinking")
+                ok, msg = True, PLAYER.play(cmd.get("url", ""), cmd.get("title", ""), cmd.get("kind", "audio"), busy)
+            else:
+                ok, msg = PLAYER.control(cmd.get("action", ""), cmd.get("value"))
+            data = json.dumps({"ok": ok, "message": msg}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+        if self.path == "/api/sensors":
+            try:
+                reading = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            except ValueError:
+                return self.send_error(400)
+            SENSORS.clear()
+            SENSORS.update(reading, at=time.time())
+            self.send_response(204)
+            return self.end_headers()
+        if self.path == "/api/card":
+            try:
+                card = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            except ValueError:
+                return self.send_error(400)
+            HUB.set(card=card)
+            self.send_response(204)
+            return self.end_headers()
+        actions = {"/api/talk": AGENT.talk, "/api/cancel": AGENT.cancel, "/api/stop": AGENT.stop_speaking,
+                   "/api/new": AGENT.new_conversation, "/api/assist": AGENT.assist, "/api/retry": AGENT.retry,
+                   # the side button's press/hold/release, for testing without a finger on it
+                   "/api/ptt/press": AGENT.ptt_press, "/api/ptt/hold": AGENT.ptt_hold,
+                   "/api/ptt/release": AGENT.ptt_release}
+        fn = actions.get(self.path)
+        if not fn:
+            return self.send_error(404)
+        threading.Thread(target=fn, daemon=True).start()
+        self.send_response(204)
+        self.end_headers()
+
+    def _events(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        q = HUB.subscribe()
+        try:
+            while True:
+                try:
+                    kind, data = q.get(timeout=15)
+                    self.wfile.write(f"event: {kind}\ndata: {data}\n\n".encode())
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            HUB.unsubscribe(q)
+
+    def log_message(self, *a):
+        pass
+
+
+def keep_services_alive():
+    while True:
+        time.sleep(30)
+        ensure_services()
+
+
+def main():
+    global AGENT
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)   # bind first: a second copy exits here
+    except OSError:
+        sys.exit("voice-server is already running")
+    ensure_services()
+    AGENT = Agent()
+    AGENT.claude.start()                    # boot Claude now so the first question doesn't wait
+    threading.Thread(target=watch_camera, daemon=True).start()
+    threading.Thread(target=BUTTON.run, daemon=True).start()
+    threading.Thread(target=watch_network, daemon=True).start()
+    threading.Thread(target=keep_services_alive, daemon=True).start()
+    log(f"listening on http://{HOST}:{PORT}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
