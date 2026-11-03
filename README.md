@@ -14,7 +14,7 @@ card on the little screen, and can actually do things on the device.
 - **Cards.** Weather, flights, stocks, lists and single facts appear as glanceable cards.
 - **Controls the phone.** Opens apps, taps, types, reads notifications, takes photos and describes them.
 - **Listens to things.** Podcasts, internet radio and music; playback pauses while you talk.
-- **Gmail.** Reads your inbox and writes drafts (never sends) through your Claude account's Gmail connector.
+- **Gmail.** Reads your inbox and writes drafts (never sends), once Gmail is connected to your Claude account (see below).
 - **Bluetooth.** Pairs and uses headphones and speakers.
 - **Memory.** Remembers what you tell it about yourself across conversations, and always knows the date,
   time and roughly where you are.
@@ -34,8 +34,9 @@ a Claude subscription that includes Claude Code.
 
 - A Rabbit R1 and a USB-C cable
 - A Mac or Linux computer with `adb`, `fastboot`, `python3`, `curl` and `unzip`
-- To build the launcher app: the Android SDK (platform 34, build-tools 34) and JDK 17.
-  (Or download `claude-r1.apk` from this project's releases and pass `--launcher-apk`.)
+- The launcher app: download `claude-r1.apk` from the
+  [latest release](https://github.com/dennisonbertram/claude-r1/releases/latest) and pass
+  `--launcher-apk claude-r1.apk`, or build it yourself with the Android SDK (platform 34, build-tools 34) and JDK 17.
 - A Claude account with Claude Code (Pro or Max)
 - Optional but strongly recommended: an [ElevenLabs](https://elevenlabs.io) API key, for a natural voice and
   accurate speech recognition
@@ -61,7 +62,7 @@ a Claude subscription that includes Claude Code.
 ## 2. Install Claude R1
 
 ```sh
-git clone https://github.com/<you>/claude-r1 && cd claude-r1
+git clone https://github.com/dennisonbertram/claude-r1 && cd claude-r1
 ./install.sh --timezone America/New_York
 ```
 
@@ -80,8 +81,15 @@ and Claude Code, then asks you:
 
 Then hold the side button and ask something.
 
-**Gmail:** connect Gmail to your Claude account at claude.ai → Settings → Connectors. Claude on the R1 uses
-the same account, so it can read your inbox and write drafts. It cannot send or delete mail.
+### Connect your email
+
+Email goes through your **Claude account**, not the R1: open [claude.ai](https://claude.ai) → Settings →
+Connectors and connect **Gmail**. Claude Code on the R1 is logged into the same account, so from then on you can
+ask "what's new in my inbox?" or "draft a reply to Sam". Claude can read mail and write drafts; it cannot send,
+delete or archive anything (drafts wait in Gmail for you to send).
+
+If Gmail isn't connected, Claude will tell you it can't reach your email. Reading mail through the R1's own
+Android account (IMAP with an app password, for non-Gmail accounts too) is planned but not built yet.
 
 ## Using it
 
