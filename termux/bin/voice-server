@@ -231,6 +231,14 @@ def run(cmd, **kw):
 
 def ensure_services():
     if subprocess.run(["pulseaudio", "--check"]).returncode:
+        # a pid file left from before a reboot can name a process that now belongs to something else, and
+        # PulseAudio then refuses to start ("already running"): no mic, no waveform. It isn't running, so clear it.
+        for d in os.listdir(os.path.join(PREFIX, "tmp")):
+            if d.startswith("pulse-"):
+                try:
+                    os.remove(os.path.join(PREFIX, "tmp", d, "pid"))
+                except OSError:
+                    pass
         run(["pulseaudio", "--start", "--load=module-sles-source", "--exit-idle-time=-1"])
     if run(["pgrep", "-f", "bin/android-mcp$"]).returncode:
         subprocess.Popen(["android-mcp"], stdout=subprocess.DEVNULL,
