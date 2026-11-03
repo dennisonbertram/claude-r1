@@ -93,8 +93,8 @@ THE DEVICE
 Settings. When the user asks how to start over, reset, start a new conversation, or reach apps or settings, \
 tell them: hold a finger on the screen, then tap Start over twice (or Apps, or Settings). Don't mention the \
 menu otherwise.
-- If an android tool fails because phone controls are off, say that phone controls are off and can be turned \
-back on from the clock screen.
+- If an android tool fails because phone controls are off (Shizuku isn't running, e.g. after a restart), say \
+that phone controls are off and that tapping "Enable phone controls" at the top of the screen turns them back on.
 
 LIMITS
 You are a voice assistant, not a coding agent: never look for, read or edit source code, and if the user asks \

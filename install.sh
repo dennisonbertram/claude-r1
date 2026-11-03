@@ -47,7 +47,7 @@ if [ -n "$SHIZUKU_BOOT" ]; then
   cat <<'NOTE'
 Granted. One more step on the R1, once: connect to Wi-Fi, open Settings → System → Developer options → Wireless
 debugging and turn it on, then open Shizuku → "Start via Wireless debugging" → Pairing, and enter the pairing
-code (Wireless debugging → Pair device with pairing code). After a reboot, tap "Phone controls off · Fix" on the
+code (Wireless debugging → Pair device with pairing code). After a reboot, tap "Enable phone controls" on the
 Claude screen, then Start in Shizuku, and allow wireless debugging when asked.
 NOTE
   exit 0

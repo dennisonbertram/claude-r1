@@ -38,6 +38,9 @@
   body.degraded .island, body.noticing .island, body.playing .island { display: inline-flex; }
   body.playing #st-left { display: none; }
   body.degraded #st-left, body.noticing #st-left, body.noticing #st-right { display: none; }
+  body.degraded .island { flex: 1; text-transform: none; letter-spacing: 0; font-size: var(--t2); font-weight: 750; }
+  body.degraded .island b { font-size: var(--t1); }
+  body.degraded #st-right { display: none; }
   body.noticing .island { flex: 1; text-transform: none; letter-spacing: 0; font-size: var(--t2); font-weight: 750; }
 
   .view { position: fixed; inset: 0; display: none; }
@@ -365,7 +368,7 @@ function renderIsland() {
   const media = S.media && calm && !noticeText && !offline && !controlsOff ? S.media : null;
   document.body.classList.toggle("playing", !!media);
   $("island").innerHTML = noticeText ? `<span class="it">${esc(noticeText)}</span>`
-    : offline ? "<b>●</b> Offline" : controlsOff ? "<b>●</b> Phone controls off · Fix"
+    : offline ? "<b>●</b> Offline" : controlsOff ? "<b>●</b> Enable phone controls"
     : media ? `<b>${media.playing ? "♪" : "❚❚"}</b><span class="it">${esc(media.title || "Playing")}</span>` : "";
 }
 
@@ -541,9 +544,12 @@ document.addEventListener("pointerup", e => {
   if (document.body.classList.contains("playing") && e.clientY < 62)      // the status row: pause / resume
     return fetch("/api/media", { method: "POST", body: JSON.stringify({ action: S.media.playing ? "pause" : "resume" }) });
   if (document.body.classList.contains("controls-off") && e.clientY < 62) {   // the status row: fix phone controls
-    showNotice("Reconnecting phone controls…", "fix" + Date.now()); renderIsland();
+    showNotice("Enabling phone controls…", "fix" + Date.now()); renderIsland();
     fetch("/api/fix", { method: "POST" }).then(r => r.json()).then(r => {
-      if (!r.ok) { noticeText = ""; renderIsland(); bridge && bridge.openApp("moe.shizuku.privileged.api"); }
+      if (r.ok) return;                   // Shizuku was fine; the connection is back
+      // Shizuku needs starting: say what to tap there, then open it
+      showNotice("Tap Start, then Allow", "fix-how" + Date.now()); renderIsland();
+      setTimeout(() => bridge && bridge.openApp("moe.shizuku.privileged.api"), 2500);
     }).catch(() => {});
     return;
   }
