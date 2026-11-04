@@ -144,6 +144,29 @@ before Wi-Fi has connected, and Android won't enable wireless debugging without 
 > keeps the window short, but only use this on networks you trust, and leave *Always allow on this network* unticked
 > unless you understand the trade-off.
 
+## Updating
+
+```sh
+cd claude-r1 && git pull
+./install.sh --launcher-apk claude-r1.apk     # the latest release's APK, or leave the flag out to build it
+```
+
+Your Termux setup, Claude login, keys, email and memories are kept: `install.sh` never reinstalls Termux or
+Shizuku, and part 2 skips everything that's already done and restarts the voice server on the new code.
+
+## Troubleshooting
+
+| What you see | What to do |
+|---|---|
+| *Enable phone controls* at the top | Shizuku stopped (usually after a reboot): `./install.sh --start-shizuku`, or tap it (see above) |
+| No waveform when you talk, nothing happens | The audio service didn't start. It recovers by itself within 30 s; if not, open Terminal from the menu (hold a finger on the screen) and run `pulseaudio --start --load=module-sles-source --exit-idle-time=-1` |
+| *Starting Claude…* stays up | Tap **Try again**; if it's still stuck, open Termux (**Apps** → Termux) and run `voice-server` to see the error |
+| Claude seems confused or stuck on an old topic | Say "start over", or hold a finger on the screen → **Start over** |
+| `install.sh` says no R1 found, or picks the wrong device | With several Android devices plugged in, choose the R1: `ANDROID_SERIAL=<serial from adb devices> ./install.sh …` |
+| Robotic voice, or it doesn't understand you | Check the ElevenLabs key in `~/.config/r1/elevenlabs_key` (it falls back to espeak when ElevenLabs fails) |
+
+Logs on the R1: `$PREFIX/tmp/r1/voice-server.log` and `$PREFIX/tmp/r1/android-mcp.log` (in Termux).
+
 ## Settings
 
 Files in Termux's `~/.config/r1/`:
@@ -187,7 +210,9 @@ node tests/ui/answers.test.mjs && node tests/ui/flow.test.mjs     # needs Google
 ```
 
 `tools/r1-say.sh --ptt "question"` asks the R1 a spoken question as if you held the button (handy for testing
-over USB), `tools/r1-state.sh` prints what the screen shows, `tools/r1-card.sh` puts a card on screen.
+over USB), `tools/r1-state.sh` prints what the screen shows, `tools/r1-card.sh` puts a card on screen,
+`tools/shot.sh out.png` takes a screenshot and `tools/ui.sh` lists the tappable things on the current screen.
+Deploy a change by copying it into Termux (`$PREFIX/bin`, `$PREFIX/share/r1/voice-ui`), or rerun `install.sh`.
 
 ## Credits
 

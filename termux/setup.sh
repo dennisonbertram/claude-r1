@@ -103,6 +103,9 @@ else
 fi
 
 step "Start"
+# restart a copy left running from a previous install, so an update takes effect now
+pkill -f 'bin/[v]oice-server$' 2>/dev/null && sleep 2 || true
+pkill -f 'bin/[a]ndroid-mcp$' 2>/dev/null || true
 (setsid nohup voice-server >>"$PREFIX/tmp/r1/voice-server.log" 2>&1 </dev/null &) || true
 am start -n ai.r1.claude/.MainActivity >/dev/null 2>&1 || true
 echo
